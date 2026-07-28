@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.png
+.vscode/
+*.npz
+*.npy
+plots/results/
