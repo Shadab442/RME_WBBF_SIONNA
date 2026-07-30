@@ -1,8 +1,8 @@
-"""Verification plots for functions/electrical_downtilt.py.
+"""Verification plots for helpers/electrical_downtilt.py.
 
-Run: python plots/scripts/verify_antenna_pattern.py
+Run: python scripts/verify_antenna_pattern.py
 
-Saves seven figures to plots/results/antenna_pattern/:
+Saves seven figures to results/antenna_pattern/:
   1. element_pattern.png             -- single element pattern (omni vs TR
                                          38.901), azimuth + elevation cuts,
                                          checked point-by-point against an
@@ -41,9 +41,9 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from sionna.phy.channel.tr38901 import AntennaElement, AntennaArray
-from functions.electrical_downtilt import ElectricalDowntilt
+from helpers.electrical_downtilt import ElectricalDowntilt
 
 CARRIER_FREQUENCY = 3.5e9
 THETA = torch.linspace(0.01, np.pi - 0.01, 721)

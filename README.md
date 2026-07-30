@@ -46,7 +46,7 @@ the same configuration. So a single vertical column (our single-port array) is j
 antenna_pattern='38.901', carrier_frequency=fc)` (or the equivalent `PanelArray` call) —
 **no custom panel/element class needed at all.**
 
-`functions/electrical_downtilt.py` (implemented, see below) contains only the one
+`helpers/electrical_downtilt.py` (implemented, see below) contains only the one
 genuinely new piece: the `ElectricalDowntilt` class implementing eq. (7.3-1) on top of
 any such single-column Sionna array (asserts `num_cols_per_panel == 1` and
 `polarization == 'single'`).
@@ -124,7 +124,7 @@ sweep.
 - Sionna's own `sionna.sys.topology` package — `gen_hexgrid_topology`, `HexGrid` (hex
   layout, UE drop, mobility — all already present, confirmed identical in spirit to
   what the repo-local version used to wrap).
-- `functions/hex_grid_view.py` — `HexGridView`, wraps a `HexGrid` + UE positions and
+- `helpers/hex_grid_view.py` — `HexGridView`, wraps a `HexGrid` + UE positions and
   adds the one thing `HexGrid.show()` doesn't do (plot the UEs), without reimplementing
   any hexagon/sector drawing.
 - Sionna's own `sionna.phy.channel.tr38901` package — `AntennaElement`, `PanelArray`
@@ -162,9 +162,9 @@ have broken on any import once `utils.py` was gone — emptied that file when de
 
 ## Files to add (new)
 
-- `functions/initial_attachment.py` — port `RsrpBasedAttachment` from `sionna-sls`.
+- `helpers/initial_attachment.py` — port `RsrpBasedAttachment` from `sionna-sls`.
   **Not yet done** (Step 4 below).
-- `functions/electrical_downtilt.py` — **done.** Contains only `ElectricalDowntilt`
+- `helpers/electrical_downtilt.py` — **done.** Contains only `ElectricalDowntilt`
   (eq. 7.3-1), built on Sionna's own `AntennaElement`/`PanelArray`/`AntennaArray` (see
   RESOLVED section above). Numerically verified: peak gain lands exactly at the
   requested `theta_etilt` (checked at 60/90/120 deg) with array gain = M (linear) at
@@ -173,7 +173,7 @@ have broken on any import once `utils.py` was gone — emptied that file when de
   `antenna_panel.py` during an intermediate version that still had its own
   reimplemented `AntennaElement`/`AntennaPanel`; renamed once those were replaced by
   Sionna's own classes, since by then the file only contained the tilt mechanism.)
-- `functions/tilt_controller.py` — **not yet done.** The control law:
+- `helpers/tilt_controller.py` — **not yet done.** The control law:
   `update_tilt(prev_tilt_deg, sinr_db) -> new_tilt_deg`. Algorithm choice (rule-based
   proportional controller vs. bandit vs. RL) not yet decided; start rule-based.
 - `run_etilt_control_loop.py` — new driver script (note: the `tests/` directory this was
@@ -203,7 +203,7 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    constraints (`min_ue_azimuth_separation_deg`, `ue_elevation_mode`/`fixed_ue_height`) —
    not needed for this check, and (b) plotting the actual UE positions, which Sionna's
    own `HexGrid.show()` doesn't do. So this step now uses Sionna's `gen_hexgrid_topology`
-   directly, plus one new small file, `functions/hex_grid_view.py` (`HexGridView`, ~25
+   directly, plus one new small file, `helpers/hex_grid_view.py` (`HexGridView`, ~25
    lines) that wraps an existing `HexGrid` + UE positions and calls the grid's own
    `show()` before scattering the UEs on top — no hexagon/sector drawing is
    reimplemented. `functions/topology.py`/`functions/simulation.py`/`functions/utils.py`
@@ -218,7 +218,7 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    render correctly, saved to `plots/results/topology/hex_topology.png`. One
    `+= ut_velocities * slot_duration` step produces real UE displacement (0.0015 m over
    0.5 ms, consistent with the 1-3 m/s velocity range used).
-2. **`functions/electrical_downtilt.py`** — **done**, see "Files to add" above for the
+2. **`helpers/electrical_downtilt.py`** — **done**, see "Files to add" above for the
    verification results (peak-tracking, array gain, 2D-panel rejection, visual sweep).
 3. **Per-UE SINR vs. every sector** — **done**, via `plots/scripts/test_tilt_effect.py`
    (new file). Genuinely frequency-selective, not scalar pathloss: the channel model is
@@ -231,12 +231,12 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    sector's port, per subcarrier, before power/SINR are computed — no fixed rx-per-tx
    association anywhere (every sector evaluated as a candidate server for every UE, fresh,
    each call). New reusable pieces (not ad-hoc script-level functions):
-   `functions/uniform_ue_drop.py` (`UniformDropTopology` — copied from `sionna-sls`, one
+   `helpers/uniform_ue_drop.py` (`UniformDropTopology` — copied from `sionna-sls`, one
    adaptation to use Sionna's own `HexGrid` instead of chaining into that repo's other
    files; a live cross-repo import was tried first and rejected — both repos have a
    top-level `functions` package, and `sionna-sls/functions/__init__.py`'s own absolute
    self-import breaks as soon as another `functions` package is loaded in the same
-   process) and `functions/kpi_calculator.py` (`KpiCalculator` — takes a configured
+   process) and `helpers/kpi_calculator.py` (`KpiCalculator` — takes a configured
    channel model, a `ResourceGrid`, and the list of per-sector `ElectricalDowntilt`s;
    exposes `compute_power_matrix_w()`/`compute_ue_sinr_db()`).
    UEs are dropped uniformly at random over the whole hex-grid area (not a fixed count per

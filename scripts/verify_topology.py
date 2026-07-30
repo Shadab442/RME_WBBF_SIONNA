@@ -1,10 +1,11 @@
 """Uses Sionna's own gen_hexgrid_topology and HexGrid directly (not the
-repo-local functions/topology.py / functions/simulation.py versions -- those
-add UE-placement constraints and a UE-plotting wrapper we don't need here;
-see functions/hex_grid_view.py for the one genuinely missing piece, UE
+repo-local functions/topology.py / functions/simulation.py versions that
+used to exist here -- those added UE-placement constraints and a
+UE-plotting wrapper we don't need, and have since been deleted; see
+helpers/hex_grid_view.py for the one genuinely missing piece, UE
 plotting, added on top of Sionna's own HexGrid.show()).
 
-Run: python plots/scripts/verify_topology.py
+Run: python scripts/verify_topology.py
 """
 
 import os
@@ -12,8 +13,8 @@ import sys
 
 from sionna.sys.topology import gen_hexgrid_topology
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from functions.hex_grid_view import HexGridView
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from helpers.hex_grid_view import HexGridView
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "results", "topology")
 os.makedirs(OUT_DIR, exist_ok=True)

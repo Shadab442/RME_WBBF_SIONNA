@@ -3,7 +3,7 @@
 SINR = signal power received in the SSB resource block, divided by
 interference from all other sectors in that same resource block, plus noise.
 Computed for every UE (dropped uniformly at random over the whole hex-grid
-area, not a fixed count per sector -- see functions/uniform_ue_drop.py),
+area, not a fixed count per sector -- see helpers/uniform_ue_drop.py),
 for several common downtilt settings (applied identically to every sector),
 compared as SINR CDFs.
 
@@ -14,7 +14,7 @@ generates them) for the per-sector antenna array and
 each sector's own current ElectricalDowntilt.weights() combines that
 sector's elements into its port, per subcarrier, before power/SINR are
 computed. No fixed rx-per-tx association anywhere (see
-functions/kpi_calculator.py): every sector is evaluated as a candidate
+helpers/kpi_calculator.py): every sector is evaluated as a candidate
 server for every UE.
 
 Style follows sionna-sls/e2e_example.py (config.seed/precision, antenna
@@ -23,7 +23,7 @@ the parts of that example
 that don't apply here (scheduler, link adaptation, power control, per-UE
 precoding) are skipped -- this project is single-port/rank-1, no MAC layer.
 
-Run: python plots/scripts/test_tilt_effect.py
+Run: python scripts/test_tilt_effect.py
 """
 
 import os
@@ -39,11 +39,11 @@ from sionna.phy.channel.utils import set_3gpp_scenario_parameters
 from sionna.phy.ofdm import ResourceGrid
 from sionna.phy.constants import BOLTZMANN_CONSTANT
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from functions.uniform_ue_drop import UniformDropTopology
-from functions.hex_grid_view import HexGridView
-from functions.electrical_downtilt import ElectricalDowntilt
-from functions.kpi_calculator import KpiCalculator
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from helpers.uniform_ue_drop import UniformDropTopology
+from helpers.hex_grid_view import HexGridView
+from helpers.electrical_downtilt import ElectricalDowntilt
+from helpers.kpi_calculator import KpiCalculator
 
 sionna.phy.config.seed = 42
 sionna.phy.config.precision = "single"
