@@ -220,11 +220,39 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    0.5 ms, consistent with the 1-3 m/s velocity range used).
 2. **`functions/electrical_downtilt.py`** — **done**, see "Files to add" above for the
    verification results (peak-tracking, array gain, 2D-panel rejection, visual sweep).
-3. **Geometric per-UE SINR vs. every sector** (fixed test tilt per sector, no attachment
-   logic yet, no scheduler/no traffic — direct pathloss + antenna gain + noise). *Verify*:
-   a UE near sector 0's boresight has clearly higher SINR from sector 0 than from other
-   sectors; changing that sector's tilt shifts the best-SINR footprint in the expected
-   direction (mini heatmap sanity check, same spirit as the earlier ns-3 REM plots).
+3. **Per-UE SINR vs. every sector** — **done**, via `plots/scripts/test_tilt_effect.py`
+   (new file). Genuinely frequency-selective, not scalar pathloss: the channel model is
+   built with the *real* per-sector array (same one each `ElectricalDowntilt` wraps, not
+   a placeholder — an earlier draft used a placeholder omni array for the channel model,
+   which was wrong once per-element combining is in play), and Sionna's own
+   `GenerateOFDMChannel` produces the full per-element, per-subcarrier channel (pathloss +
+   shadow fading + multipath fast fading, all as the 3GPP model generates them). Each
+   sector's own current `ElectricalDowntilt.weights()` combines its elements into that
+   sector's port, per subcarrier, before power/SINR are computed — no fixed rx-per-tx
+   association anywhere (every sector evaluated as a candidate server for every UE, fresh,
+   each call). New reusable pieces (not ad-hoc script-level functions):
+   `functions/uniform_ue_drop.py` (`UniformDropTopology` — copied from `sionna-sls`, one
+   adaptation to use Sionna's own `HexGrid` instead of chaining into that repo's other
+   files; a live cross-repo import was tried first and rejected — both repos have a
+   top-level `functions` package, and `sionna-sls/functions/__init__.py`'s own absolute
+   self-import breaks as soon as another `functions` package is loaded in the same
+   process) and `functions/kpi_calculator.py` (`KpiCalculator` — takes a configured
+   channel model, a `ResourceGrid`, and the list of per-sector `ElectricalDowntilt`s;
+   exposes `compute_power_matrix_w()`/`compute_ue_sinr_db()`).
+   UEs are dropped uniformly at random over the whole hex-grid area (not a fixed count per
+   sector — confirmed Sionna's own `HexGrid.call()` hardcodes per-sector-wedge dropping
+   with no parameter to disable it, so `UniformDropTopology.sample_ut_loc()` does the
+   drop itself, independently, using only the site positions from Sionna's `HexGrid`).
+   `NUM_RINGS` is a plain script parameter (not hardcoded) for comparing ring counts.
+   *Verified*: with `NUM_RINGS=1` (7 sites, 21 sectors, 150 UEs), median SINR rises
+   monotonically from 4.2 dB (downtilt −10°) to 6.8 dB (downtilt +10°) — a real,
+   physically sensible effect (more downtilt → less inter-site interference). A
+   center-cell-only (single-site) version was tried first and gave an almost perfectly
+   flat CDF across the same tilt sweep — correct, not a bug: with all sectors co-located
+   at one site, a shared symmetric tilt changes signal and interference by nearly the same
+   factor for most UEs, so it cancels in the ratio. That result is exactly why moving to
+   the full ring mattered — inter-*site* interference (a different location, so a
+   genuinely different elevation angle) is where tilt actually shows up.
 4. **`initial_attachment.py`** (ported `RsrpBasedAttachment`) — wire it to Step 3's SINR
    values. *Verify*: every UE gets exactly one serving sector; assignment matches manual
    argmax spot-checks for a handful of UEs; reassignment changes sensibly when a sector's

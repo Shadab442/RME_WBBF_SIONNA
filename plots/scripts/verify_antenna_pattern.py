@@ -2,25 +2,34 @@
 
 Run: python plots/scripts/verify_antenna_pattern.py
 
-Saves six figures to plots/results/antenna_pattern/:
-  1. element_pattern.png       -- single element pattern (omni vs TR 38.901),
-                                  azimuth + elevation cuts, checked point-by-point
-                                  against an independent reference formula.
-  2. element_pattern_3d.png    -- same element pattern, as a 3D surface colored
-                                  by gain.
-  3. panel_vs_element.png      -- element-only vs full-array gain at boresight
-                                  (downtilt=0), fixed M -- shows the
-                                  directivity/sidelobe structure the array factor
-                                  adds on top of the element pattern.
-  4. panel_pattern_3d.png      -- same combined array pattern, as a 3D surface.
-  5. tilt_effect.png           -- effect of electrical downtilt on the array gain
-                                  pattern, fixed M -- the beam should visibly
-                                  rotate and peak at each requested downtilt.
-  6. num_elements_effect.png   -- effect of the number of vertical elements M on
-                                  the pattern for one fixed, off-boresight
-                                  downtilt -- more elements should narrow the main
-                                  lobe (and add sidelobes) while the peak stays at
-                                  the same angle.
+Saves seven figures to plots/results/antenna_pattern/:
+  1. element_pattern.png             -- single element pattern (omni vs TR
+                                         38.901), azimuth + elevation cuts,
+                                         checked point-by-point against an
+                                         independent reference formula.
+  2. element_pattern_3d.png          -- same element pattern, as a 3D surface
+                                         colored by gain.
+  3. panel_vs_element.png            -- element-only vs full-array gain at
+                                         boresight (downtilt=0), fixed M, for
+                                         both the "rectangular" (eq. 7.3-1's
+                                         own uniform amplitude) and "hanning"
+                                         windows -- shows the directivity/
+                                         sidelobe tradeoff between them.
+  4. panel_pattern_3d_rectangular.png -- combined array pattern (rectangular
+                                         window), as a 3D surface.
+  4b. panel_pattern_3d_hanning.png    -- same, but with the hanning window.
+  5. tilt_effect.png                 -- effect of electrical downtilt on the
+                                         array gain pattern, fixed M
+                                         (rectangular window) -- the beam
+                                         should visibly rotate and peak at
+                                         each requested downtilt.
+  6. num_elements_effect.png         -- effect of the number of vertical
+                                         elements M on the pattern for one
+                                         fixed, off-boresight downtilt
+                                         (rectangular window) -- more elements
+                                         should narrow the main lobe (and add
+                                         sidelobes) while the peak stays at
+                                         the same angle.
 """
 
 import os
@@ -64,12 +73,12 @@ def reference_38901_gain_db(theta_deg, phi_deg):
     return G_E_MAX - np.minimum(-(a_v + a_h), A_MAX)
 
 
-def make_etilt(num_elements: int, vertical_spacing: float = 0.5) -> ElectricalDowntilt:
+def make_etilt(num_elements: int, vertical_spacing: float = 0.5, window: str = "rectangular") -> ElectricalDowntilt:
     array = AntennaArray(num_rows=num_elements, num_cols=1, polarization="single",
                          polarization_type="V", antenna_pattern="38.901",
                          carrier_frequency=CARRIER_FREQUENCY,
                          vertical_spacing=vertical_spacing)
-    return ElectricalDowntilt(array, carrier_frequency=CARRIER_FREQUENCY)
+    return ElectricalDowntilt(array, carrier_frequency=CARRIER_FREQUENCY, window=window)
 
 
 def new_polar_fig(title):
@@ -240,60 +249,73 @@ fig.colorbar(mappable, ax=ax, shrink=0.6, pad=0.1, label="Power (dB)")
 
 save(fig, "element_pattern_3d.png")
 
-# 2. Element-only vs full-panel gain at boresight (downtilt = 0 deg)
+# 2. Element-only vs full-panel gain at boresight (downtilt = 0 deg), rectangular
+#    vs. hanning window -- shows the sidelobe-suppression/peak-gain tradeoff
+#    directly: hanning gives up some peak gain for far fewer/shallower nulls.
 M = 8
-etilt = make_etilt(M)
-etilt.set_tilt(0.0)
-f_theta, f_phi = etilt.array.ant_pol1.field(THETA, PHI0)
+etilts = {window: make_etilt(M, window=window) for window in ("rectangular", "hanning")}
+for etilt in etilts.values():
+    etilt.set_tilt(0.0)
+f_theta, f_phi = etilts["rectangular"].array.ant_pol1.field(THETA, PHI0)
 fig, ax = new_polar_fig(f"Panel vs. element gain (downtilt = 0°, M={M})")
 ax.plot(THETA.numpy(), to_db(f_theta ** 2 + f_phi ** 2), label="element only")
-ax.plot(THETA.numpy(), to_db(etilt.gain_pattern(THETA, PHI0)), label=f"panel (M={M})")
+for window, etilt in etilts.items():
+    ax.plot(THETA.numpy(), to_db(etilt.gain_pattern(THETA, PHI0)), label=f"panel ({window}, M={M})")
 ax.legend(fontsize=8)
 save(fig, "panel_vs_element.png")
-print(f"[2] peak array gain at boresight: {etilt.array_factor(torch.tensor([np.pi/2])).item():.2f} "
-      f"(expected {M})")
+for window, etilt in etilts.items():
+    peak_gain = etilt.array_factor(torch.tensor([np.pi / 2])).item()
+    print(f"[2] peak array gain at boresight ({window}): {peak_gain:.2f} "
+         f"({10 * np.log10(peak_gain):.2f} dB)")
 
-# 2b. Composite panel pattern in 3D (M=8, downtilt=0), same style as the element
-#     3D plot, but the panel has ~140 dB of dynamic range (sidelobes/nulls from
-#     the array factor) vs. the element's ~23 dB -- a linear-gain radius would
-#     make the sidelobes invisible (collapsed to a sliver next to the main lobe).
-#     So here the SHAPE is dB-with-floor (dB above a fixed dB-below-peak floor,
-#     clipped at 0) instead of linear gain, which is what actually makes the
-#     array's sidelobe structure visible; color is still gain in dB.
-etilt.set_tilt(0.0)
-grid_shape = theta3d_grid.shape
-gain_panel_flat = etilt.gain_pattern(theta3d_grid.reshape(-1), phi3d_grid.reshape(-1))
-gain_panel_db_3d = to_db(gain_panel_flat).reshape(grid_shape)
-
+# 2b. Composite panel pattern in 3D (M=8, downtilt=0), one figure per window,
+#     same style as the element 3D plot, but the panel has much more dynamic
+#     range (sidelobes/nulls from the array factor) than the element's ~23 dB --
+#     a linear-gain radius would make the sidelobes invisible (collapsed to a
+#     sliver next to the main lobe). So here the SHAPE is dB-with-floor (dB
+#     above a fixed dB-below-peak floor, clipped at 0) instead of linear gain,
+#     which is what actually makes the array's sidelobe structure visible;
+#     color is still gain in dB. Rectangular and hanning use the same floor
+#     (relative to each one's own peak) so the two figures are visually
+#     comparable despite hanning's lower peak gain.
 FLOOR_BELOW_PEAK_DB = 40.0
-peak_db_panel = gain_panel_db_3d.max()
-radius_panel = np.clip(gain_panel_db_3d - (peak_db_panel - FLOOR_BELOW_PEAK_DB), 0, None)
+for window, etilt in etilts.items():
+    etilt.set_tilt(0.0)
+    grid_shape = theta3d_grid.shape
+    gain_panel_flat = etilt.gain_pattern(theta3d_grid.reshape(-1), phi3d_grid.reshape(-1))
+    gain_panel_db_3d = to_db(gain_panel_flat).reshape(grid_shape)
 
-x_p = radius_panel * np.sin(theta_np) * np.cos(phi_np)
-y_p = radius_panel * np.sin(theta_np) * np.sin(phi_np)
-z_p = radius_panel * np.cos(theta_np)
+    peak_db_panel = gain_panel_db_3d.max()
+    radius_panel = np.clip(gain_panel_db_3d - (peak_db_panel - FLOOR_BELOW_PEAK_DB), 0, None)
 
-# Color normalization matches the same floor as the shape -- otherwise the -120 dB
-# nulls would dominate the color scale and everything visible would look the same.
-norm_p = mcolors.Normalize(vmin=peak_db_panel - FLOOR_BELOW_PEAK_DB, vmax=peak_db_panel)
-surf_colors_p = cm.viridis(norm_p(np.clip(gain_panel_db_3d, peak_db_panel - FLOOR_BELOW_PEAK_DB, None)))
+    x_p = radius_panel * np.sin(theta_np) * np.cos(phi_np)
+    y_p = radius_panel * np.sin(theta_np) * np.sin(phi_np)
+    z_p = radius_panel * np.cos(theta_np)
 
-fig = plt.figure(figsize=(8, 7))
-ax = fig.add_subplot(1, 1, 1, projection="3d")
-ax.plot_surface(x_p, y_p, z_p, facecolors=surf_colors_p, rstride=1, cstride=1,
-               linewidth=0, antialiased=True, shade=False)
-ax.set_box_aspect((np.ptp(x_p), np.ptp(y_p), np.ptp(z_p)))
-ax.set_xlabel("x")
-ax.set_ylabel("y")
-ax.set_zlabel("z")
-ax.set_title(f"3D Composite Panel Gain Pattern (M={M}, downtilt=0°)", fontsize=11)
-ax.view_init(elev=25, azim=-60)
+    # Color normalization matches the same floor as the shape -- otherwise the
+    # deep nulls would dominate the color scale and everything visible would
+    # look the same.
+    norm_p = mcolors.Normalize(vmin=peak_db_panel - FLOOR_BELOW_PEAK_DB, vmax=peak_db_panel)
+    surf_colors_p = cm.viridis(norm_p(np.clip(gain_panel_db_3d, peak_db_panel - FLOOR_BELOW_PEAK_DB, None)))
 
-mappable_p = cm.ScalarMappable(cmap="viridis", norm=norm_p)
-mappable_p.set_array(gain_panel_db_3d)
-fig.colorbar(mappable_p, ax=ax, shrink=0.6, pad=0.1, label="Power (dB)")
+    fig = plt.figure(figsize=(8, 7))
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+    ax.plot_surface(x_p, y_p, z_p, facecolors=surf_colors_p, rstride=1, cstride=1,
+                   linewidth=0, antialiased=True, shade=False)
+    ax.set_box_aspect((np.ptp(x_p), np.ptp(y_p), np.ptp(z_p)))
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("z")
+    ax.set_title(f"3D Composite Panel Gain Pattern ({window}, M={M}, downtilt=0°)", fontsize=11)
+    ax.view_init(elev=25, azim=-60)
 
-save(fig, "panel_pattern_3d.png")
+    mappable_p = cm.ScalarMappable(cmap="viridis", norm=norm_p)
+    mappable_p.set_array(gain_panel_db_3d)
+    fig.colorbar(mappable_p, ax=ax, shrink=0.6, pad=0.1, label="Power (dB)")
+
+    save(fig, f"panel_pattern_3d_{window}.png")
+
+etilt = etilts["rectangular"]  # used unchanged by sections 3-4 below
 
 # 3. Effect of electrical downtilt, fixed M
 fig, ax = new_polar_fig(f"Effect of electrical downtilt (M={M})")

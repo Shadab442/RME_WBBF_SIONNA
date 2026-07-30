@@ -7,6 +7,7 @@ sionna.sys.topology.gen_hexgrid_topology(..., return_grid=True)) and adds
 that one missing piece, instead of redrawing the grid/sector geometry again.
 """
 
+import matplotlib.pyplot as plt
 import torch
 
 
@@ -30,3 +31,10 @@ class HexGridView:
         ax.scatter(ut_loc_np[:, 0], ut_loc_np[:, 1], color="k", marker="x", label="UE")
         ax.legend()
         return fig
+
+    def save(self, path: str, dpi: int = 150, **show_kwargs) -> None:
+        """Draws (via `show`) and saves the figure to `path`, closing it
+        afterward -- the save/close boilerplate every caller was repeating."""
+        fig = self.show(**show_kwargs)
+        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)

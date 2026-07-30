@@ -32,9 +32,8 @@ ut_loc, bs_loc, ut_orientations, bs_orientations, ut_velocities, in_state, los, 
         return_grid=True,
     )
 
-fig = HexGridView(grid, ut_loc).show()
 out_path = os.path.join(OUT_DIR, "hex_topology.png")
-fig.savefig(out_path, dpi=150, bbox_inches="tight")
+HexGridView(grid, ut_loc).save(out_path)
 print(f"Saved: {out_path}")
 print(f"BS positions: {tuple(bs_loc.shape)}, UE positions: {tuple(ut_loc.shape)}")
 
