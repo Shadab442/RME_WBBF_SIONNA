@@ -124,9 +124,11 @@ sweep.
 - Sionna's own `sionna.sys.topology` package — `gen_hexgrid_topology`, `HexGrid` (hex
   layout, UE drop, mobility — all already present, confirmed identical in spirit to
   what the repo-local version used to wrap).
-- `helpers/hex_grid_view.py` — `HexGridView`, wraps a `HexGrid` + UE positions and
-  adds the one thing `HexGrid.show()` doesn't do (plot the UEs), without reimplementing
-  any hexagon/sector drawing.
+- `helpers/scenario_view.py` — `plot_scenario`/`save_scenario`, combines a `HexGrid` +
+  UE positions and adds the one thing `HexGrid.show()` doesn't do (plot the UEs),
+  without reimplementing any hexagon/sector drawing. Deliberately plain functions, kept
+  separate from both the topology and UE-drop layers, since it's the one place that
+  legitimately depends on both at once.
 - Sionna's own `sionna.phy.channel.tr38901` package — `AntennaElement`, `PanelArray`
   (or its `Antenna`/`AntennaArray` convenience subclasses). Standard-compliant element
   pattern and array geometry, reused directly with **no local antenna file at all** for
@@ -178,7 +180,7 @@ have broken on any import once `utils.py` was gone — emptied that file when de
   proportional controller vs. bandit vs. RL) not yet decided; start rule-based.
 - `run_etilt_control_loop.py` — new driver script (note: the `tests/` directory this was
   originally sketched under no longer exists; place this alongside the other verification
-  scripts under `plots/scripts/`, or a new location, when it's built). **One persistent
+  scripts under `scripts/`, or a new location, when it's built). **One persistent
   topology** (not an outer "num_drops" random-redrop loop — tilt control needs a stable
   scene across time), nested slot/epoch loop (slot = SINR/attachment update, epoch = tilt
   update), logging `(epoch, sector_id, tilt_deg, sinr_db)`. No scheduler/OLLA/power
@@ -193,7 +195,7 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    left that could regress from that cluster. (`topology.py`/`utils.py`/`simulation.py`
    were also later deleted, once unused and confirmed redundant — see "Files removed"
    below — so there's nothing there to regress either.)
-1. **Topology + mobility standalone** — **done**, via `plots/scripts/verify_topology.py`.
+1. **Topology + mobility standalone** — **done**, via `scripts/verify_topology.py`.
    **Revised to use Sionna's own topology tools directly, not the repo-local ones.**
    Checked `functions/topology.py`'s `gen_hexgrid_topology` and `functions/simulation.py`'s
    `CenterCellGrid` against Sionna's own `sionna.sys.topology` package and found most of
@@ -203,10 +205,10 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    constraints (`min_ue_azimuth_separation_deg`, `ue_elevation_mode`/`fixed_ue_height`) —
    not needed for this check, and (b) plotting the actual UE positions, which Sionna's
    own `HexGrid.show()` doesn't do. So this step now uses Sionna's `gen_hexgrid_topology`
-   directly, plus one new small file, `helpers/hex_grid_view.py` (`HexGridView`, ~25
-   lines) that wraps an existing `HexGrid` + UE positions and calls the grid's own
-   `show()` before scattering the UEs on top — no hexagon/sector drawing is
-   reimplemented. `functions/topology.py`/`functions/simulation.py`/`functions/utils.py`
+   directly, plus one new small file, `helpers/scenario_view.py` (`plot_scenario`/
+   `save_scenario`, plain functions) that combines an existing `HexGrid` + UE positions
+   and calls the grid's own `show()` before scattering the UEs on top — no hexagon/sector
+   drawing is reimplemented. `functions/topology.py`/`functions/simulation.py`/`functions/utils.py`
    were kept unused for a short while after this, then deleted once confirmed
    byte-identical to the copies in the sibling `sionna-sls` repo and confirmed nothing
    in this repo still imported them (see "Files removed" above) — available there for
@@ -215,12 +217,12 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    call — `num_rings=0` raises `AssertionError`), so a 1-ring (7-site, 21-sector) layout
    is generated and shown in full (no center-cell crop, unlike the old `CenterCellGrid`
    version) — hex boundaries, per-site sector numbering, and 105 UEs (5/sector) all
-   render correctly, saved to `plots/results/topology/hex_topology.png`. One
+   render correctly, saved to `results/topology/hex_topology.png`. One
    `+= ut_velocities * slot_duration` step produces real UE displacement (0.0015 m over
    0.5 ms, consistent with the 1-3 m/s velocity range used).
 2. **`helpers/electrical_downtilt.py`** — **done**, see "Files to add" above for the
    verification results (peak-tracking, array gain, 2D-panel rejection, visual sweep).
-3. **Per-UE SINR vs. every sector** — **done**, via `plots/scripts/test_tilt_effect.py`
+3. **Per-UE SINR vs. every sector** — **done**, via `scripts/test_tilt_effect.py`
    (new file). Genuinely frequency-selective, not scalar pathloss: the channel model is
    built with the *real* per-sector array (same one each `ElectricalDowntilt` wraps, not
    a placeholder — an earlier draft used a placeholder omni array for the channel model,
@@ -230,19 +232,25 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    sector's own current `ElectricalDowntilt.weights()` combines its elements into that
    sector's port, per subcarrier, before power/SINR are computed — no fixed rx-per-tx
    association anywhere (every sector evaluated as a candidate server for every UE, fresh,
-   each call). New reusable pieces (not ad-hoc script-level functions):
-   `helpers/uniform_ue_drop.py` (`UniformDropTopology` — copied from `sionna-sls`, one
-   adaptation to use Sionna's own `HexGrid` instead of chaining into that repo's other
-   files; a live cross-repo import was tried first and rejected — both repos have a
-   top-level `functions` package, and `sionna-sls/functions/__init__.py`'s own absolute
-   self-import breaks as soon as another `functions` package is loaded in the same
-   process) and `helpers/kpi_calculator.py` (`KpiCalculator` — takes a configured
-   channel model, a `ResourceGrid`, and the list of per-sector `ElectricalDowntilt`s;
-   exposes `compute_power_matrix_w()`/`compute_ue_sinr_db()`).
+   each call). New reusable pieces (not ad-hoc script-level functions): originally one
+   file (`UniformDropTopology`, copied from `sionna-sls` with one adaptation to use
+   Sionna's own `HexGrid` directly -- a live cross-repo import was tried first and
+   rejected, since both repos have a top-level `functions` package and
+   `sionna-sls/functions/__init__.py`'s own absolute self-import breaks as soon as
+   another `functions` package is loaded in the same process), later split (once
+   mobility/clustered drops made the original name misleading -- it was doing site
+   topology, UE dropping, *and* coverage-boundary math under a name that only
+   described one of those) into `helpers/cellular_topology.py` (`CellularTopology` --
+   site/sector geometry plus `is_within_coverage`/`mirror_bs_loc`/`default_drop_radius`
+   only) and `helpers/ue_drop.py` (`sample_uniform_ut_loc`/`sample_clustered_ut_loc`,
+   plain functions taking a topology and returning initial UE positions). Plus
+   `helpers/kpi_calculator.py` (`KpiCalculator` — takes a configured channel model, a
+   `ResourceGrid`, and the list of per-sector `ElectricalDowntilt`s; exposes
+   `compute_power_matrix_w()`/`compute_ue_sinr_db()`).
    UEs are dropped uniformly at random over the whole hex-grid area (not a fixed count per
    sector — confirmed Sionna's own `HexGrid.call()` hardcodes per-sector-wedge dropping
-   with no parameter to disable it, so `UniformDropTopology.sample_ut_loc()` does the
-   drop itself, independently, using only the site positions from Sionna's `HexGrid`).
+   with no parameter to disable it, so `sample_uniform_ut_loc()` does the drop itself,
+   independently, using only the site positions from Sionna's `HexGrid`).
    `NUM_RINGS` is a plain script parameter (not hardcoded) for comparing ring counts.
    *Verified*: with `NUM_RINGS=1` (7 sites, 21 sectors, 150 UEs), median SINR rises
    monotonically from 4.2 dB (downtilt −10°) to 6.8 dB (downtilt +10°) — a real,

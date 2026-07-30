@@ -3,7 +3,7 @@
 SINR = signal power received in the SSB resource block, divided by
 interference from all other sectors in that same resource block, plus noise.
 Computed for every UE (dropped uniformly at random over the whole hex-grid
-area, not a fixed count per sector -- see helpers/uniform_ue_drop.py),
+area, not a fixed count per sector -- see helpers/ue_drop.py),
 for several common downtilt settings (applied identically to every sector),
 compared as SINR CDFs.
 
@@ -40,8 +40,9 @@ from sionna.phy.ofdm import ResourceGrid
 from sionna.phy.constants import BOLTZMANN_CONSTANT
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from helpers.uniform_ue_drop import UniformDropTopology
-from helpers.hex_grid_view import HexGridView
+from helpers.cellular_topology import CellularTopology
+from helpers.ue_drop import sample_uniform_ut_loc
+from helpers.scenario_view import save_scenario
 from helpers.electrical_downtilt import ElectricalDowntilt
 from helpers.kpi_calculator import KpiCalculator
 
@@ -83,15 +84,16 @@ min_bs_ut_dist, isd, bs_height, min_ut_height, max_ut_height, indoor_probability
 scenario_params = {"isd": isd, "bs_height": bs_height, "min_bs_ut_dist": min_bs_ut_dist,
                    "min_ut_height": min_ut_height}
 
-# Uniform drop topology with hexagonal cellular scenario
-topo = UniformDropTopology(scenario_params, num_rings=NUM_RINGS,
-                           batch_size=MAX_REALIZATION_CUDA)
+# Cellular site/sector topology; UEs are dropped uniformly on top of it (see
+# helpers/ue_drop.py) -- the topology itself doesn't know how UEs get placed.
+topo = CellularTopology(scenario_params, num_rings=NUM_RINGS,
+                        batch_size=MAX_REALIZATION_CUDA)
 # Number of BS
 num_bs = topo.num_bs
 
 # UT locations
-ut_loc = topo.sample_ut_loc(NUM_UT, UT_HEIGHT, dtype=topo.bs_loc.dtype,
-                           device=topo.bs_loc.device, batch_size=MAX_REALIZATION_CUDA)
+ut_loc = sample_uniform_ut_loc(topo, NUM_UT, UT_HEIGHT, dtype=topo.bs_loc.dtype,
+                               device=topo.bs_loc.device, batch_size=MAX_REALIZATION_CUDA)
 
 # Zero antenna orientation, all outdoor, no movement of UTs
 ut_orientations = torch.zeros(MAX_REALIZATION_CUDA, NUM_UT, 3, dtype=topo.bs_loc.dtype,
@@ -102,7 +104,7 @@ in_state = torch.zeros(MAX_REALIZATION_CUDA, NUM_UT, dtype=torch.bool,
                        device=topo.bs_loc.device)  # all outdoor
 
 # Visualize the hexaogonal scenario
-HexGridView(topo.grid, ut_loc[0:1]).save(os.path.join(OUT_DIR, "scenario.png"))
+save_scenario(os.path.join(OUT_DIR, "scenario.png"), topo.grid, ut_loc[0])
 print(f"Scenario: {NUM_RINGS} ring(s), {topo.num_cells} sites, {num_bs} sectors, "
      f"{NUM_UT} UEs (uniform over the whole area)")
 
@@ -170,8 +172,8 @@ def sample_sinr_db_crn(tilt_values, total_realizations, max_realization_cuda, re
 
     for chunk_idx in range(num_chunks):
         if resample_topology:
-            new_ut_loc = topo.sample_ut_loc(
-                NUM_UT, UT_HEIGHT, dtype=topo.bs_loc.dtype, device=topo.bs_loc.device,
+            new_ut_loc = sample_uniform_ut_loc(
+                topo, NUM_UT, UT_HEIGHT, dtype=topo.bs_loc.dtype, device=topo.bs_loc.device,
                 batch_size=max_realization_cuda,
             )
             new_bs_virtual_loc = topo.mirror_bs_loc(new_ut_loc)
