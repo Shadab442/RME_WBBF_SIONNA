@@ -4,6 +4,60 @@ Written from a long discussion chat, meant to give a fresh implementation chat f
 without replaying the whole conversation. Point a new chat at this file and ask it to
 implement accordingly.
 
+## Environment Setup
+
+Use the `sionna-wbbf` virtualenv at `/home/shadab/venvs/sionna-wbbf` for everything in
+this repo — do not use `/usr/virtualenvs/sionna2`. `sionna2`'s torch build
+(`2.10.0+cu128`) has a real cuBLAS bug on this machine's RTX 5090: any batched GEMM
+(`set_topology()`/`generate_h_freq()` with `batch_size > 1`, i.e. `MAX_REALIZATION_CUDA
+> 1`) throws `CUBLAS_STATUS_INVALID_VALUE`. `sionna-wbbf`'s torch (`2.11.0+cu128`) does
+not have this bug, confirmed by direct testing.
+
+To create it from scratch (or reproduce it elsewhere):
+
+```bash
+python3.12 -m venv /home/shadab/venvs/sionna-wbbf
+/home/shadab/venvs/sionna-wbbf/bin/pip install -r requirements.txt
+```
+
+To activate it (once per shell session):
+
+```bash
+source /home/shadab/venvs/sionna-wbbf/bin/activate
+```
+
+Then run any script in this repo normally:
+
+```bash
+python scripts/<script_name>.py
+```
+
+Deactivate with `deactivate`. To run a one-off script without activating, call the
+venv's Python directly instead: `/home/shadab/venvs/sionna-wbbf/bin/python3
+scripts/<script_name>.py`.
+
+**`requirements.txt` must stay in sync**: whenever a new package is installed into
+`sionna-wbbf`, add it (with its pinned version) to `requirements.txt` in the same change.
+
+### Long-running scripts: use `run_in_tmux.sh`
+
+Some scripts here (e.g. `test_dynamic_scenario_tilts_effect.py` at `NUM_SLOTS=500`) run for
+minutes. Since this repo is normally used over an SSH/VS Code Remote connection that can
+drop and kill whatever was running in its terminal, launch anything long-running inside
+a detached tmux session instead, so it keeps running on the remote machine independent
+of your client connection:
+
+```bash
+./run_in_tmux.sh scripts/tests/test_dynamic_scenario_tilts_effect.py
+```
+
+This starts a tmux session named after the script (refuses to start a second one if a
+session with that name is already running), tees its output to
+`results/tests/_run_logs/<script>_<timestamp>.log`, and prints how to reattach
+(`tmux attach -t <session_name>`; detach again with `Ctrl+B` then `D`, which leaves it
+running). It always runs scripts with the `sionna-wbbf` venv's Python, regardless of
+whether that venv is active in your current shell.
+
 ## Goal
 
 Build a controller that takes UE SINR measurements as feedback and adjusts a shared
@@ -195,7 +249,7 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    left that could regress from that cluster. (`topology.py`/`utils.py`/`simulation.py`
    were also later deleted, once unused and confirmed redundant — see "Files removed"
    below — so there's nothing there to regress either.)
-1. **Topology + mobility standalone** — **done**, via `scripts/verify_topology.py`.
+1. **Topology + mobility standalone** — **done**, via `scripts/verifications/verify_topology.py`.
    **Revised to use Sionna's own topology tools directly, not the repo-local ones.**
    Checked `functions/topology.py`'s `gen_hexgrid_topology` and `functions/simulation.py`'s
    `CenterCellGrid` against Sionna's own `sionna.sys.topology` package and found most of
@@ -217,12 +271,12 @@ have broken on any import once `utils.py` was gone — emptied that file when de
    call — `num_rings=0` raises `AssertionError`), so a 1-ring (7-site, 21-sector) layout
    is generated and shown in full (no center-cell crop, unlike the old `CenterCellGrid`
    version) — hex boundaries, per-site sector numbering, and 105 UEs (5/sector) all
-   render correctly, saved to `results/topology/hex_topology.png`. One
+   render correctly, saved to `results/verifications/topology/hex_topology.png`. One
    `+= ut_velocities * slot_duration` step produces real UE displacement (0.0015 m over
    0.5 ms, consistent with the 1-3 m/s velocity range used).
 2. **`helpers/electrical_downtilt.py`** — **done**, see "Files to add" above for the
    verification results (peak-tracking, array gain, 2D-panel rejection, visual sweep).
-3. **Per-UE SINR vs. every sector** — **done**, via `scripts/test_tilt_effect.py`
+3. **Per-UE SINR vs. every sector** — **done**, via `scripts/tests/test_static_global_tilts_effect.py`
    (new file). Genuinely frequency-selective, not scalar pathloss: the channel model is
    built with the *real* per-sector array (same one each `ElectricalDowntilt` wraps, not
    a placeholder — an earlier draft used a placeholder omni array for the channel model,

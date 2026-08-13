@@ -18,16 +18,26 @@ def sample_disk_offset(radius: float, num_points: int, dtype, device, generator=
 
 
 def sample_valid_offset(centers: torch.Tensor, radius: float, topology, dtype, device,
-                        generator=None, max_rounds: int = 100) -> torch.Tensor:
+                        generator=None, max_rounds: int = 100, min_dist_from_site: float = None) -> torch.Tensor:
     """For each row in centers [N, 2], samples a random disk offset (radius)
     such that centers[i] + offset lies within topology's real hex-grid
     footprint (topology.is_within_coverage), rejecting and resampling
     per-point as needed. Falls back to zero offset (stays at its center)
     for any point still invalid after max_rounds, so this can never loop
     forever regardless of how large radius is relative to the coverage area.
+
+    :param min_dist_from_site: if given, candidates within this distance of
+        ANY BS site are also rejected (3GPP's minimum BS-UT distance) --
+        needed whenever the result feeds directly into a channel
+        computation (an actual UE position), since near-zero BS-UT distance
+        blows up pathloss into inf/nan. Not needed for offsets that only
+        produce a cluster center or a waypoint destination -- those aren't
+        evaluated by the channel model themselves.
     """
     xy = centers.clone()
     valid = torch.zeros(centers.shape[0], dtype=torch.bool, device=device)
+    if min_dist_from_site is not None:
+        site_loc = topology.site_loc.to(dtype=dtype, device=device)
     for _ in range(max_rounds):
         if valid.all():
             break
@@ -35,6 +45,11 @@ def sample_valid_offset(centers: torch.Tensor, radius: float, topology, dtype, d
         offsets = sample_disk_offset(radius, pending.shape[0], dtype, device, generator)
         candidates = centers[pending] + offsets
         ok = topology.is_within_coverage(candidates)
+        if min_dist_from_site is not None:
+            nearest_dist = torch.linalg.norm(
+                candidates[:, None, :] - site_loc[None, :, :], dim=-1
+            ).min(dim=-1).values
+            ok = ok & (nearest_dist >= min_dist_from_site)
         xy[pending[ok]] = candidates[ok]
         valid[pending[ok]] = True
     return xy
@@ -121,6 +136,70 @@ def sample_uniform_ut_loc(
     return torch.cat([ut_loc_xy, z], dim=-1)  # [num_ut, 3]
 
 
+def sample_grid_points(topology, spacing: float, ut_height: float, dtype, device,
+                       disk_radius: float = None) -> torch.Tensor:
+    """Deterministic regular (x, y) grid spanning the hex-grid's real
+    coverage footprint, at fixed height -- same two validity checks as
+    sample_uniform_ut_loc (within the actual footprint, at least
+    min_bs_ut_dist from every site), but a fixed lattice instead of random
+    samples. Meant for helpers/radio_map.py, where grid points stand in
+    for "UEs" whose channel gets computed once and reused, rather than for
+    an actual UE population.
+
+    :param spacing: grid spacing [m] along both x and y.
+    :param disk_radius: bounding disk the lattice is generated over before
+        filtering; defaults to topology.default_drop_radius.
+    :output grid_loc: [num_grid_points, 3] -- how many lattice points
+        survive the validity filters isn't specified directly, it falls
+        out of spacing/disk_radius.
+    """
+    if disk_radius is None:
+        disk_radius = topology.default_drop_radius
+    site_loc = topology.site_loc.to(dtype=dtype, device=device)
+    min_bs_ut_dist = topology.min_bs_ut_dist
+
+    coords = torch.arange(-disk_radius, disk_radius + spacing, spacing, dtype=dtype, device=device)
+    grid_x, grid_y = torch.meshgrid(coords, coords, indexing="xy")
+    candidates = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)  # [N, 2]
+
+    nearest_dist = torch.linalg.norm(
+        candidates[:, None, :] - site_loc[None, :, :], dim=-1
+    ).min(dim=-1).values
+    far_enough = nearest_dist >= min_bs_ut_dist
+    within_coverage = topology.is_within_coverage(candidates)
+    kept = candidates[far_enough & within_coverage]
+
+    z = torch.full((kept.shape[0], 1), float(ut_height), dtype=dtype, device=device)
+    return torch.cat([kept, z], dim=-1)  # [num_grid_points, 3]
+
+
+def sample_cluster_start_xy(topology, num_groups: int, generator=None):
+    """``num_groups`` cluster-center (x, y) positions, split as evenly as
+    possible across ``topology``'s sites (so a large ``num_groups`` doesn't
+    collapse onto a handful of sites by chance), each placed uniformly at
+    random within its own site's cell footprint (a disk of the site's hex
+    circumradius, rejected against the real coverage footprint).
+
+    Feed the result straight into ``sample_clustered_ut_loc`` as
+    ``cluster_centers``.
+    """
+    num_cells = topology.num_cells
+    base, extra = divmod(num_groups, num_cells)
+    clusters_per_site = [base + 1 if site_idx < extra else base for site_idx in range(num_cells)]
+    cell_radius = float(topology.grid.cell_radius.item())
+    start_xy_list = []
+    for site_idx, n_clusters in enumerate(clusters_per_site):
+        if n_clusters == 0:
+            continue
+        site_center = topology.site_loc[site_idx:site_idx + 1].expand(n_clusters, -1)
+        cluster_xy = sample_valid_offset(
+            site_center, cell_radius, topology,
+            topology.bs_loc.dtype, topology.bs_loc.device, generator,
+        )
+        start_xy_list.extend(tuple(xy) for xy in cluster_xy.tolist())
+    return start_xy_list
+
+
 def sample_clustered_ut_loc(
     topology,
     cluster_centers,
@@ -152,11 +231,13 @@ def sample_clustered_ut_loc(
         members_per_cluster = [members_per_cluster] * num_clusters
 
     member_cluster_idx = torch.repeat_interleave(
-        torch.arange(num_clusters), torch.tensor(members_per_cluster)
+        torch.arange(num_clusters, device=device),
+        torch.tensor(members_per_cluster, device=device),
     )
     center_per_member = centers[member_cluster_idx]  # [num_ut, 2]
 
-    xy = sample_valid_offset(center_per_member, deviation_radius, topology, dtype, device, generator)
+    xy = sample_valid_offset(center_per_member, deviation_radius, topology, dtype, device, generator,
+                             min_dist_from_site=topology.min_bs_ut_dist)
     z = torch.full((xy.shape[0], 1), float(ut_height), dtype=dtype, device=device)
     ut_loc = torch.cat([xy, z], dim=-1)
     return ut_loc, member_cluster_idx

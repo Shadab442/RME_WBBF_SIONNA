@@ -41,29 +41,7 @@ class ReferencePointGroupMobility(MobilityModel):
     resampled on arrival). Every member's position is that reference point
     plus a per-member offset within ``deviation_radius`` of it. That offset
     is persistent state -- it drifts by a small random step each call to
-    ``step()`` (speed ``member_jitter_speed``), rather than being redrawn
-    from scratch every time, so members shuffle around smoothly within
-    their cluster instead of teleporting to a new random spot in the disk
-    every frame (which would swamp the group's own, typically much slower,
-    drift).
-
-    (A "deterministic" scripted start->end path variant existed earlier and
-    was removed -- its traversal speed was an accidental byproduct of site
-    spacing and total simulation length rather than a controlled parameter,
-    and its post-arrival behavior [freeze in place] wasn't well thought
-    through. Revisit later if a controlled near-to-far scenario is needed
-    again, with an explicit per-group speed instead.)
-
-    ``deviation_radius`` is the knob for how much area each cluster spans --
-    small values give tight, visually distinct clusters; values approaching
-    ``topo.default_drop_radius`` make clusters spread across most of the
-    coverage area. Member offsets are rejection-sampled against the real
-    footprint at t=0, and step()'s two-tier fallback (see there) keeps every
-    later position valid too, so members never end up outside it at any point
-    in time -- not just for the fresh-candidate case, but also across a
-    reference point's own movement between steps.
-
-    :ivar ut_loc: [num_ut, 3] current member positions.
+    ``step()`` (speed ``member_jitter_speed``).
     """
 
     def __init__(
@@ -125,6 +103,19 @@ class ReferencePointGroupMobility(MobilityModel):
 
         super().__init__(ut_loc)
 
+    def _is_valid(self, xy: torch.Tensor) -> torch.Tensor:
+        """True where xy is both within the real coverage footprint and at
+        least min_bs_ut_dist from every BS site -- the same two conditions
+        helpers.ue_drop.sample_uniform_ut_loc enforces for a plain UE drop.
+        Both matter here: a too-close position blows up pathloss into
+        inf/nan in the channel model just as much as an out-of-coverage one
+        breaks the topology's own assumptions.
+        """
+        within_coverage = self.topo.is_within_coverage(xy)
+        site_loc = self.topo.site_loc.to(dtype=xy.dtype, device=xy.device)
+        nearest_dist = torch.linalg.norm(xy[:, None, :] - site_loc[None, :, :], dim=-1).min(dim=-1).values
+        return within_coverage & (nearest_dist >= self.topo.min_bs_ut_dist)
+
     def _pick_new_waypoint(self, group_idx: int) -> None:
         """Draws a new random destination (within the topology's actual
         coverage footprint) and speed for a group's reference point."""
@@ -136,21 +127,33 @@ class ReferencePointGroupMobility(MobilityModel):
         self.speed[group_idx] = self.min_speed + (self.max_speed - self.min_speed) * u
 
     def step(self, dt: float) -> torch.Tensor:
+        # Cluster center movement. The destination itself is always valid
+        # (sample_valid_offset rejects invalid candidates when it's picked),
+        # but the STRAIGHT LINE from here to there is not: the coverage
+        # footprint is a union of hexagons, not a convex region, so it has
+        # notches a straight line between two valid points can still cross.
+        # An uncorrected reference point can then travel outside coverage
+        # for as long as the current leg of transit takes -- observed
+        # empirically staying out for 38+ consecutive steps on a 1-ring
+        # topology. So each candidate step is itself checked: if it would
+        # leave coverage, stay put this step and pick a new destination
+        # instead of continuing through invalid territory.
         for i in range(self.ref_xy.shape[0]):
             to_dest = self.dest_xy[i] - self.ref_xy[i]
             dist = torch.linalg.norm(to_dest)
             step_len = self.speed[i] * dt
             if dist <= step_len:
-                self.ref_xy[i] = self.dest_xy[i]
-                self._pick_new_waypoint(i)
+                candidate = self.dest_xy[i]
             else:
-                self.ref_xy[i] = self.ref_xy[i] + to_dest / dist * step_len
+                candidate = self.ref_xy[i] + to_dest / dist * step_len
+            if self.topo.is_within_coverage(candidate.unsqueeze(0))[0]:
+                self.ref_xy[i] = candidate
+                if dist <= step_len:
+                    self._pick_new_waypoint(i)
+            else:
+                self._pick_new_waypoint(i)
 
         # Members drift by a small random step from their PREVIOUS offset
-        # (not a fresh resample) -- clipped back to deviation_radius if it
-        # would wander too far from the reference point, rather than
-        # rejected outright, so members glide along the cluster's edge
-        # instead of freezing there.
         ref_per_member = self.ref_xy[self.member_group_idx]
         num_ut = ref_per_member.shape[0]
         jitter = sample_disk_offset(self.member_jitter_speed * dt, num_ut, self.dtype, self.device, self.generator)
@@ -160,30 +163,39 @@ class ReferencePointGroupMobility(MobilityModel):
         new_offset[too_far] = new_offset[too_far] / mag[too_far, None] * self.deviation_radius
 
         xy = ref_per_member + new_offset
-        ok = self.topo.is_within_coverage(xy)
+        ok = self._is_valid(xy)
 
         # Tier 1 fallback: reuse the previous offset with the NEW reference
-        # point. Not guaranteed valid on its own -- the reference point moved
-        # this step, so "old offset + new reference point" is a combination
-        # that was never actually validated (only "old reference point + old
-        # offset", last step, and "new reference point + new offset", just
-        # above, were ever checked).
+        # point.
         fallback_xy = ref_per_member + self.member_offset
-        fallback_ok = self.topo.is_within_coverage(fallback_xy)
+        fallback_ok = self._is_valid(fallback_xy)
         use_fallback = (~ok) & fallback_ok
         xy[use_fallback] = fallback_xy[use_fallback]
         new_offset[use_fallback] = self.member_offset[use_fallback]
 
         # Tier 2 (last resort): even that combination is invalid -- e.g. the
         # reference point moved outward and this member was already near the
-        # edge. Freeze this member at its previous ABSOLUTE position for this
-        # one step (guaranteed valid, since it was accepted last step -- or,
-        # at t=0, came from sample_clustered_ut_loc's own rejection sampling),
-        # and recompute its stored offset relative to the new reference point
-        # so next step's bookkeeping stays consistent.
+        # edge. Freezing at the previous absolute position (as this used to
+        # do) guarantees validity but not progress: if the reference point
+        # keeps moving in a direction that regenerates the same conflict
+        # (e.g. it's tracking along the boundary for a few steps), the
+        # member can stay frozen for many consecutive steps while the rest
+        # of its group keeps moving, visibly "left behind" at the edge.
+        # Resampling a fresh valid offset around the CURRENT reference point
+        # instead (same rejection sampling used to build the initial drop
+        # and to pick waypoints) keeps the member moving every step and
+        # rejoins normal jitter-based drift from a valid state, rather than
+        # waiting on a lucky jitter draw or the group wandering back away
+        # from the boundary on its own.
         still_bad = (~ok) & (~fallback_ok)
-        xy[still_bad] = self.ut_loc[still_bad, :2]
-        new_offset[still_bad] = xy[still_bad] - ref_per_member[still_bad]
+        if still_bad.any():
+            resampled_xy = sample_valid_offset(
+                ref_per_member[still_bad], self.deviation_radius, self.topo,
+                self.dtype, self.device, self.generator,
+                min_dist_from_site=self.topo.min_bs_ut_dist,
+            )
+            xy[still_bad] = resampled_xy
+            new_offset[still_bad] = resampled_xy - ref_per_member[still_bad]
 
         self.member_offset = new_offset
         self.ut_loc = torch.cat([xy, self._z], dim=-1)

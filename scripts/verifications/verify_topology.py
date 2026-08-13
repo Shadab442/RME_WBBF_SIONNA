@@ -5,7 +5,7 @@ UE-plotting wrapper we don't need, and have since been deleted; see
 helpers/scenario_view.py for the one genuinely missing piece, UE
 plotting, added on top of Sionna's own HexGrid.show()).
 
-Run: python scripts/verify_topology.py
+Run: python scripts/verifications/verify_topology.py
 """
 
 import os
@@ -13,10 +13,10 @@ import sys
 
 from sionna.sys.topology import gen_hexgrid_topology
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from helpers.scenario_view import save_scenario
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "results", "topology")
+OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "verifications", "topology")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 NUM_UT_PER_SECTOR = 5

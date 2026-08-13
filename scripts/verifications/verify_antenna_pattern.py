@@ -1,8 +1,12 @@
 """Verification plots for helpers/electrical_downtilt.py.
 
-Run: python scripts/verify_antenna_pattern.py
+Run: python scripts/verifications/verify_antenna_pattern.py
 
-Saves seven figures to results/antenna_pattern/:
+The downtilt sweep itself is a separate script, verify_tilt_effect.py (a
+different question -- how an already-verified pattern rotates with tilt --
+from whether the pattern's shape is correct in the first place).
+
+Saves six figures to results/verifications/antenna_pattern/:
   1. element_pattern.png             -- single element pattern (omni vs TR
                                          38.901), azimuth + elevation cuts,
                                          checked point-by-point against an
@@ -18,12 +22,7 @@ Saves seven figures to results/antenna_pattern/:
   4. panel_pattern_3d_rectangular.png -- combined array pattern (rectangular
                                          window), as a 3D surface.
   4b. panel_pattern_3d_hanning.png    -- same, but with the hanning window.
-  5. tilt_effect.png                 -- effect of electrical downtilt on the
-                                         array gain pattern, fixed M
-                                         (rectangular window) -- the beam
-                                         should visibly rotate and peak at
-                                         each requested downtilt.
-  6. num_elements_effect.png         -- effect of the number of vertical
+  5. num_elements_effect.png         -- effect of the number of vertical
                                          elements M on the pattern for one
                                          fixed, off-boresight downtilt
                                          (rectangular window) -- more elements
@@ -41,7 +40,7 @@ import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
 import matplotlib.cm as cm
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from sionna.phy.channel.tr38901 import AntennaElement, AntennaArray
 from helpers.electrical_downtilt import ElectricalDowntilt
 
@@ -49,7 +48,7 @@ CARRIER_FREQUENCY = 3.5e9
 THETA = torch.linspace(0.01, np.pi - 0.01, 721)
 PHI0 = torch.zeros_like(THETA)
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "results", "antenna_pattern")
+OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "verifications", "antenna_pattern")
 os.makedirs(OUT_DIR, exist_ok=True)
 
 
@@ -315,17 +314,7 @@ for window, etilt in etilts.items():
 
     save(fig, f"panel_pattern_3d_{window}.png")
 
-etilt = etilts["rectangular"]  # used unchanged by sections 3-4 below
-
-# 3. Effect of electrical downtilt, fixed M
-fig, ax = new_polar_fig(f"Effect of electrical downtilt (M={M})")
-for downtilt_deg in [-10, -5, 0, 5, 10]:
-    etilt.set_tilt(downtilt_deg)
-    ax.plot(THETA.numpy(), to_db(etilt.gain_pattern(THETA, PHI0)), label=f"{downtilt_deg:+.0f}°")
-ax.legend(fontsize=8, loc="lower left")
-save(fig, "tilt_effect.png")
-
-# 4. Effect of number of elements M, fixed off-boresight downtilt
+# 3. Effect of number of elements M, fixed off-boresight downtilt
 FIXED_DOWNTILT = -5.0
 fig, ax = new_polar_fig(f"Effect of M (downtilt = {FIXED_DOWNTILT:+.0f}°)")
 for num_elements in [2, 4, 8, 16]:
