@@ -27,6 +27,7 @@ class IndependentDqn(TiltPolicy):
         batch_size: int = 32,
         replay_capacity: int = 10_000,
         warmup_steps: int = 0,
+        train_steps_per_interval: int = 1,
         target_update_steps: int = 50,
         epsilon_start: float = 1.0,
         epsilon_end: float = 0.01,
@@ -36,6 +37,8 @@ class IndependentDqn(TiltPolicy):
     ):
         """
         :param algorithm_seed: seeds EVERYTHING algorithm-side
+        :param train_steps_per_interval: gradient steps taken per sector at
+            each observe() call 
         """
         super().__init__()
         self.num_sectors = num_sectors
@@ -44,6 +47,7 @@ class IndependentDqn(TiltPolicy):
         self.gamma = gamma
         self.batch_size = batch_size
         self.warmup_steps = warmup_steps
+        self.train_steps_per_interval = train_steps_per_interval
         self.target_update_steps = target_update_steps
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
@@ -87,7 +91,8 @@ class IndependentDqn(TiltPolicy):
             buffer.add(observations[sector], actions[sector], rewards[sector],
                       next_observations[sector], float(terminal))
             if len(buffer) >= max(self.batch_size, self.warmup_steps):
-                self._learn(sector)
+                for _ in range(self.train_steps_per_interval):
+                    self._learn(sector)
         if self.steps % self.target_update_steps == 0:
             for target, network in zip(self.targets, self.networks):
                 target.load_state_dict(network.state_dict())

@@ -128,7 +128,11 @@ with no adaptation.
 **DRL** (`RLTiltController`, policy in `drl/`) — an independent Double-DQN per sector,
 trained online across intervals. Its state is each sector's pooled (coverage, overshoot);
 its reward is a weighted combination of the two; its action selects a downtilt from the
-same candidate sweep the search-based methods use.
+same candidate sweep the search-based methods use. Only one real action is taken per
+interval, so `algorithms.drl.dqn.train_steps_per_interval` controls how many gradient
+steps replay the growing buffer at each interval boundary — this does not add extra
+environment interaction, it just extracts more training signal from what's already
+collected, since a gradient step here is negligible next to an interval's simulation cost.
 
 ## Simulation Engine: Blocks and Interconnections
 
@@ -178,14 +182,15 @@ hexagonal site/sector grid once; every other block reads its geometry from this.
 at construction: clustered around per-site cluster centers for RPGM, or uniform for the
 random-walk baseline.
 
+![Initial clustered UE drop](results/verifications/mobility/initial_positions.png)
+
 **Mobility** (`helpers/mobility.py`, `ReferencePointGroupMobility` / `RandomWalkMobility`)
 — owns each realization's current UE positions and steps them forward by one measurement
 interval on every draw.
 
-![Initial clustered UE drop](results/verifications/mobility/initial_positions.png)
+![RPGM cluster mobility animation](results/verifications/mobility/rpgm_animation.gif)
 
-(Animated verification: `results/verifications/mobility/rpgm_animation.gif` and
-`random_walk_animation.gif`.)
+(Random-walk baseline, not embedded here: `results/verifications/mobility/random_walk_animation.gif`.)
 
 **Large-Scale Channel** (`helpers/large_scale_channel.py`, `LargeScaleChannel`) — given
 the topology and the current UE positions, draws a fresh pathloss and shadow-fading state
@@ -195,7 +200,12 @@ every measurement interval (large-scale only; no fast/frequency-selective fading
 instance per sector; holds its current downtilt and exposes the array's gain pattern at
 that tilt.
 
-![Effect of electrical downtilt](results/verifications/tilt_effect/tilt_effect.png)
+<table>
+<tr>
+<td><img src="results/verifications/tilt_effect/tilt_effect.png" width="420" alt="Effect of electrical downtilt"></td>
+<td><img src="results/verifications/antenna_pattern/panel_pattern_3d_rectangular.png" width="420" alt="3D composite panel gain pattern"></td>
+</tr>
+</table>
 
 **KPI Manager** (`helpers/kpi_manager.py`, `KpiManager`) — combines a channel state and
 the sectors' current gain patterns into per-UE received power, then SINR, coverage, and
@@ -214,8 +224,18 @@ each, RPGM mobility, 300 UEs over 1 ring (7 sites, 21 sectors), coverage thresho
 Coverage is the fraction of UEs whose serving-sector SINR exceeds that threshold, pooled
 over each interval.
 
-_[Simulation run in progress — this section is filled in once `main.py` completes; see
-`results/tests/_run_logs/` for live progress.]_
+![Coverage vs. time](results/main/coverage_vs_time.png)
+
+Steady-state mean coverage (last 50 intervals): Dynamic Local Oracle 0.8931, Dynamic
+Local Causal 0.8867, Adaptive Legacy 0.8736, No Tilt 0.8676, DRL 0.8672.
+
+Oracle sits consistently above every causal method, as expected of a non-causal upper
+bound; Causal (identical search, one interval behind) recovers most of that gap.
+Adaptive Legacy holds a real, steady margin over the fixed No-Tilt baseline. DRL tracks
+No Tilt almost exactly here — this run predates the `train_steps_per_interval` fix
+(see [Tilt Control Algorithms](#tilt-control-algorithms)'s DRL entry): at one gradient
+step per interval, 350 intervals is far too few to learn anything, which this result
+confirms rather than contradicts. A rerun with `train_steps_per_interval=100` is next.
 
 ## Future Extensions
 

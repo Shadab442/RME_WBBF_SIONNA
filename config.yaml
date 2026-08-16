@@ -38,6 +38,7 @@ simulation:
 
 algorithms:
   optimization:
+    enabled: true
     coordinate_ascent_max_rounds: 20
 
   adaptive_legacy:
@@ -62,6 +63,7 @@ algorithms:
       batch_size: 32
       replay_capacity: 10000
       warmup_steps: 32
+      train_steps_per_interval: 100
       target_update_steps: 30
       epsilon_start: 1.0
       epsilon_end: 0.01

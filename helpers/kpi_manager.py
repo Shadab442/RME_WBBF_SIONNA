@@ -194,7 +194,7 @@ class KpiManager:
         self._ut_loc_r0_chunks = []
 
     def pool_measurement(self, state: LargeScaleState, adaptive_tilt_deg, drl_tilt_deg,
-                         downtilt_sweep_deg, ut_loc_r0=None):
+                         downtilt_sweep_deg, ut_loc_r0=None, needs_sweep: bool = True):
         """One measurement draw's contribution: the swept table (Oracle/
         Causal) plus Adaptive Legacy/DRL/No Tilt's own current-tilt power,
         appended to this interval's running pool.
@@ -206,8 +206,12 @@ class KpiManager:
         :param downtilt_sweep_deg: candidate tilts [deg] for the swept table
         :param ut_loc_r0: [num_ue, 3] realization-0's UE positions this draw
             -- only given on the chunk containing realization 0
+        :param needs_sweep: if False, skips building the swept
+            [tilt, sector, ue] table -- only Dynamic Local Oracle/Causal's
+            coordinate-ascent search needs it 
         """
-        self._table_chunks.append(self.compute_tilt_sector_ue_rx_power(state, downtilt_sweep_deg))
+        if needs_sweep:
+            self._table_chunks.append(self.compute_tilt_sector_ue_rx_power(state, downtilt_sweep_deg))
 
         adaptive_tilt_list = adaptive_tilt_deg.tolist() if hasattr(adaptive_tilt_deg, "tolist") else list(adaptive_tilt_deg)
         for etilt, tilt in zip(self.sector_etilts, adaptive_tilt_list):
@@ -234,7 +238,7 @@ class KpiManager:
         the pooled result. Call start_interval() again before the next one.
         """
         return {
-            "power_table": np.concatenate(self._table_chunks, axis=1),
+            "power_table": np.concatenate(self._table_chunks, axis=1) if self._table_chunks else None,
             "adaptive_power_w_r0": np.concatenate(self._adaptive_r0_chunks, axis=1),
             "drl_power_w_r0": np.concatenate(self._drl_r0_chunks, axis=1),
             "no_tilt_power_w": np.concatenate(self._no_tilt_chunks, axis=0),

@@ -82,6 +82,7 @@ class SimulationEngine:
 
         self.downtilt_sweep_deg = np.asarray(antenna_cfg["downtilt_sweep_deg"])
         self.coverage_threshold_db = kpi_cfg["coverage_threshold_db"]
+        self.search_enabled = optimization_cfg["enabled"]
         self.coordinate_ascent_max_rounds = optimization_cfg["coordinate_ascent_max_rounds"]
         self.sinr_percentiles = kpi_cfg["sinr_percentiles"]
         self.adaptive_legacy_overlap_margin_db = adaptive_legacy_cfg["overlap_margin_db"]
@@ -211,20 +212,25 @@ class SimulationEngine:
         self.ut_velocities = torch.zeros_like(self.ut_orientations)
         self.in_state = torch.zeros(max_realization_cuda, num_ut, dtype=torch.bool, device=self.topology.bs_loc.device)
 
-        # Initialization of KPI history arrays
+        # Initialization of KPI history arrays. Oracle/Causal's arrays are
+        # NaN-filled rather than zero-filled -- if search_enabled is False
+        # they're never written, and NaN makes that honestly visible
+        # everywhere the history is printed/plotted/saved, instead of a
+        # misleading 0.0 (same convention drl_loss_per_interval already
+        # uses for intervals before learning starts).
         n = self.num_tilt_control_intervals
-        self.coverage_dynamic_local_oracle = np.zeros(n)
-        self.coverage_dynamic_local_causal = np.zeros(n)
+        self.coverage_dynamic_local_oracle = np.full(n, np.nan)
+        self.coverage_dynamic_local_causal = np.full(n, np.nan)
         self.coverage_adaptive_legacy = np.zeros(n)
         self.coverage_no_tilt = np.zeros(n)
         self.coverage_drl = np.zeros(n)
-        self.sinr_percentiles_dynamic_local_oracle = np.zeros((len(self.sinr_percentiles), n))
-        self.sinr_percentiles_dynamic_local_causal = np.zeros((len(self.sinr_percentiles), n))
+        self.sinr_percentiles_dynamic_local_oracle = np.full((len(self.sinr_percentiles), n), np.nan)
+        self.sinr_percentiles_dynamic_local_causal = np.full((len(self.sinr_percentiles), n), np.nan)
         self.sinr_percentiles_adaptive_legacy = np.zeros((len(self.sinr_percentiles), n))
         self.sinr_percentiles_no_tilt = np.zeros((len(self.sinr_percentiles), n))
         self.sinr_percentiles_drl = np.zeros((len(self.sinr_percentiles), n))
-        self.dynamic_local_oracle_tilt_deg_history = np.zeros((n, self.num_bs))
-        self.dynamic_local_causal_tilt_deg_history = np.zeros((n, self.num_bs))
+        self.dynamic_local_oracle_tilt_deg_history = np.full((n, self.num_bs), np.nan)
+        self.dynamic_local_causal_tilt_deg_history = np.full((n, self.num_bs), np.nan)
         self.adaptive_legacy_tilt_deg_history = np.zeros((n, self.num_bs))
         self.drl_tilt_deg_history = np.zeros((n, self.num_bs))
 
@@ -309,37 +315,39 @@ class SimulationEngine:
         to drive their own decision update. Writes into self's pre-allocated
         history arrays at index `interval`.
         """
-        pooled_power_table = pooled["power_table"]
         pooled_adaptive_power_w_r0 = pooled["adaptive_power_w_r0"]
         pooled_drl_power_w_r0 = pooled["drl_power_w_r0"]
         pooled_no_tilt_power_w = pooled["no_tilt_power_w"]
         pooled_ut_loc_r0 = pooled["ut_loc_r0"]
 
-        # Oracle: decide AND score using THIS interval's pooled power table -- no lag.
-        dynamic_local_oracle_assignment = self.dynamic_local_oracle_controller.update(
-            self.kpi_manager, pooled_power_table, self.coverage_threshold_db
-        )
-        oracle_kpis = self.kpi_manager.compute_ue_kpis(pooled_power_table, dynamic_local_oracle_assignment,
-                                                        self.coverage_threshold_db)
-        self.coverage_dynamic_local_oracle[interval] = oracle_kpis["coverage"]
-        self.sinr_percentiles_dynamic_local_oracle[:, interval] = np.percentile(oracle_kpis["sinr_db"],
-                                                                                self.sinr_percentiles)
-        self.dynamic_local_oracle_tilt_deg_history[interval] = self.downtilt_sweep_deg[dynamic_local_oracle_assignment]
+        if self.search_enabled:
+            pooled_power_table = pooled["power_table"]
 
-        # Causal: score the assignment decided from data through the previous interval against
-        # this interval's actual pooled power table.
-        causal_applied_assignment = (
-            self.dynamic_local_causal_controller.assignment
-            if self.dynamic_local_causal_controller.assignment is not None
-            else dynamic_local_oracle_assignment
-        )
-        causal_kpis = self.kpi_manager.compute_ue_kpis(pooled_power_table, causal_applied_assignment,
-                                                        self.coverage_threshold_db)
-        self.coverage_dynamic_local_causal[interval] = causal_kpis["coverage"]
-        self.sinr_percentiles_dynamic_local_causal[:, interval] = np.percentile(causal_kpis["sinr_db"],
-                                                                                self.sinr_percentiles)
-        self.dynamic_local_causal_tilt_deg_history[interval] = self.downtilt_sweep_deg[causal_applied_assignment]
-        self.dynamic_local_causal_controller.update(self.kpi_manager, pooled_power_table, self.coverage_threshold_db)
+            # Oracle: decide AND score using THIS interval's pooled power table -- no lag.
+            dynamic_local_oracle_assignment = self.dynamic_local_oracle_controller.update(
+                self.kpi_manager, pooled_power_table, self.coverage_threshold_db
+            )
+            oracle_kpis = self.kpi_manager.compute_ue_kpis(pooled_power_table, dynamic_local_oracle_assignment,
+                                                            self.coverage_threshold_db)
+            self.coverage_dynamic_local_oracle[interval] = oracle_kpis["coverage"]
+            self.sinr_percentiles_dynamic_local_oracle[:, interval] = np.percentile(oracle_kpis["sinr_db"],
+                                                                                    self.sinr_percentiles)
+            self.dynamic_local_oracle_tilt_deg_history[interval] = self.downtilt_sweep_deg[dynamic_local_oracle_assignment]
+
+            # Causal: score the assignment decided from data through the previous interval against
+            # this interval's actual pooled power table.
+            causal_applied_assignment = (
+                self.dynamic_local_causal_controller.assignment
+                if self.dynamic_local_causal_controller.assignment is not None
+                else dynamic_local_oracle_assignment
+            )
+            causal_kpis = self.kpi_manager.compute_ue_kpis(pooled_power_table, causal_applied_assignment,
+                                                            self.coverage_threshold_db)
+            self.coverage_dynamic_local_causal[interval] = causal_kpis["coverage"]
+            self.sinr_percentiles_dynamic_local_causal[:, interval] = np.percentile(causal_kpis["sinr_db"],
+                                                                                    self.sinr_percentiles)
+            self.dynamic_local_causal_tilt_deg_history[interval] = self.downtilt_sweep_deg[causal_applied_assignment]
+            self.dynamic_local_causal_controller.update(self.kpi_manager, pooled_power_table, self.coverage_threshold_db)
 
         # Adaptive Legacy: score at the tilt already in effect, THEN update
         self.adaptive_legacy_tilt_deg_history[interval] = self.adaptive_legacy_controller.tilt_deg.copy()
@@ -406,6 +414,7 @@ class SimulationEngine:
                     self.kpi_manager.pool_measurement(
                         state, self.adaptive_legacy_controller.tilt_deg, drl_tilt_deg_this_interval,
                         self.downtilt_sweep_deg, ut_loc_r0=ut_loc_r0_this_draw if chunk_idx == 0 else None,
+                        needs_sweep=self.search_enabled,
                     )
 
             self.position_history[interval] = position_snapshot
@@ -416,14 +425,14 @@ class SimulationEngine:
             self.execute_algorithms(pooled, interval, drl_tilt_deg_this_interval)
 
             if interval % 10 == 0 or is_last_interval:
-                print(
-                    f"interval {interval:3d}/{self.num_tilt_control_intervals - 1}: "
-                    f"dynamic_local_oracle={self.coverage_dynamic_local_oracle[interval]:.3f}, "
-                    f"dynamic_local_causal={self.coverage_dynamic_local_causal[interval]:.3f}, "
-                    f"adaptive_legacy={self.coverage_adaptive_legacy[interval]:.3f}, "
-                    f"no_tilt={self.coverage_no_tilt[interval]:.3f}, "
-                    f"drl={self.coverage_drl[interval]:.3f}"
-                )
+                fields = []
+                if self.search_enabled:
+                    fields.append(f"dynamic_local_oracle={self.coverage_dynamic_local_oracle[interval]:.3f}")
+                    fields.append(f"dynamic_local_causal={self.coverage_dynamic_local_causal[interval]:.3f}")
+                fields.append(f"adaptive_legacy={self.coverage_adaptive_legacy[interval]:.3f}")
+                fields.append(f"no_tilt={self.coverage_no_tilt[interval]:.3f}")
+                fields.append(f"drl={self.coverage_drl[interval]:.3f}")
+                print(f"interval {interval:3d}/{self.num_tilt_control_intervals - 1}: " + ", ".join(fields))
 
         no_tilt_deg = np.full(self.num_bs, NO_TILT_DEG)
 

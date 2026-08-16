@@ -9,8 +9,8 @@ def create_policy(name, num_sectors, num_features, num_actions,
     :param name: "random" | "independent-dqn".
     :param dqn_kwargs: dict of IndependentDqn hyperparameters (hidden_sizes,
         learning_rate, gamma, batch_size, replay_capacity, warmup_steps,
-        target_update_steps, epsilon_start, epsilon_end,
-        epsilon_decay_rate); ignored for "random".
+        train_steps_per_interval, target_update_steps, epsilon_start,
+        epsilon_end, epsilon_decay_rate); ignored for "random".
     """
     if name == "random":
         from drl.random_policy import RandomPolicy
