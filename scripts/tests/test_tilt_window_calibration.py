@@ -46,11 +46,12 @@ from sionna.phy.constants import BOLTZMANN_CONSTANT
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from helpers.cellular_topology import CellularTopology
-from helpers.config import load_config
+from helpers.utils import load_config
 from helpers.electrical_downtilt import ElectricalDowntilt
-from helpers.kpi_calculator import KpiCalculator
+from helpers.kpi_manager import KpiManager
+from helpers.large_scale_channel import LargeScaleChannel
 from helpers.mobility import ReferencePointGroupMobility
-from helpers.ue_drop import sample_cluster_start_xy, sample_clustered_ut_loc
+from helpers.ue_drop import sample_cluster_center_across_sites, sample_clustered_ut_loc
 from helpers.tilt_controller import LocalTiltSelector
 
 sionna.phy.config.seed = 42
@@ -61,35 +62,36 @@ sionna.phy.config.device = DEVICE
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "tests", "tilt_window_calibration")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-CFG = load_config("test_tilt_window_calibration")
+CFG = load_config()
+CALIBRATION_CFG = CFG["test_tilt_window_calibration"]
 
-CARRIER_FREQUENCY = CFG["carrier_frequency"]
-SCENARIO = CFG["scenario"]
-NUM_RINGS = CFG["num_rings"]
-NUM_UT = CFG["num_ut"]
-UT_HEIGHT = CFG["ut_height"]
-M = CFG["m"]
-DOWNTILT_SWEEP_DEG = CFG["downtilt_sweep_deg"]
-ANTENNA_WINDOW = CFG["antenna_window"]
-BS_TX_POWER_DBM = CFG["bs_tx_power_dbm"]
-CHANNEL_BANDWIDTH_PRB = CFG["channel_bandwidth_prb"]
-TEMPERATURE = CFG["temperature"]
+CARRIER_FREQUENCY = CFG["channel"]["carrier_frequency"]
+SCENARIO = CFG["topology"]["scenario"]
+NUM_RINGS = CFG["topology"]["num_rings"]
+NUM_UT = CFG["topology"]["num_ut"]
+UT_HEIGHT = CFG["topology"]["ut_height"]
+M = CFG["antenna"]["m"]
+DOWNTILT_SWEEP_DEG = CFG["antenna"]["downtilt_sweep_deg"]
+ANTENNA_WINDOW = CFG["antenna"]["antenna_window"]
+BS_TX_POWER_DBM = CFG["channel"]["bs_tx_power_dbm"]
+CHANNEL_BANDWIDTH_PRB = CFG["channel"]["channel_bandwidth_prb"]
+TEMPERATURE = CFG["channel"]["temperature"]
 
-COVERAGE_THRESHOLD_DB = CFG["coverage_threshold_db"]
-COORDINATE_ASCENT_MAX_ROUNDS = CFG["coordinate_ascent_max_rounds"]
+COVERAGE_THRESHOLD_DB = CFG["kpi"]["coverage_threshold_db"]
+COORDINATE_ASCENT_MAX_ROUNDS = CFG["algorithms"]["optimization"]["coordinate_ascent_max_rounds"]
 
-NUM_GROUPS = CFG["num_groups"]
+NUM_GROUPS = CFG["mobility"]["num_groups"]
 MEMBERS_PER_GROUP = NUM_UT // NUM_GROUPS
-DEVIATION_RADIUS_FRAC_AREA = CFG["deviation_radius_frac_area"]
-MEMBER_JITTER_SPEED = CFG["member_jitter_speed"]
+DEVIATION_RADIUS_FRAC_AREA = CFG["mobility"]["deviation_radius_frac_area"]
+MEMBER_JITTER_SPEED = CFG["mobility"]["member_jitter_speed"]
 
-MEASUREMENT_INTERVAL_S = CFG["measurement_interval_s"]
-NUM_REALIZATIONS_PER_SLOT = CFG["num_realizations_per_slot"]
-MAX_REALIZATION_CUDA = CFG["max_realization_cuda"]
+MEASUREMENT_INTERVAL_S = CFG["simulation"]["measurement_interval_s"]
+NUM_REALIZATIONS_PER_SLOT = CFG["simulation"]["num_realizations_per_slot"]
+MAX_REALIZATION_CUDA = CFG["simulation"]["max_realization_cuda"]
 
-CANDIDATE_WINDOW_SLOTS = CFG["candidate_window_slots"]
-NUM_WINDOWS_PER_CANDIDATE = CFG["num_windows_per_candidate"]
-MOBILITY_SPEED_SETTINGS = CFG["mobility_speed_settings"]
+CANDIDATE_WINDOW_SLOTS = CALIBRATION_CFG["candidate_window_slots"]
+NUM_WINDOWS_PER_CANDIDATE = CALIBRATION_CFG["num_windows_per_candidate"]
+MOBILITY_SPEED_SETTINGS = CALIBRATION_CFG["mobility_speed_settings"]
 
 assert NUM_UT % NUM_GROUPS == 0, "NUM_UT must be divisible by NUM_GROUPS for equal-sized RPGM groups"
 assert NUM_REALIZATIONS_PER_SLOT % MAX_REALIZATION_CUDA == 0, \
@@ -137,14 +139,16 @@ def configure_simulation():
     bs_tx_power_w = 10 ** ((BS_TX_POWER_DBM - 30.0) / 10.0)
     channel_bandwidth_hz = CHANNEL_BANDWIDTH_PRB * 12 * 30e3  # 30 kHz SCS
     noise_power_w = BOLTZMANN_CONSTANT * TEMPERATURE * channel_bandwidth_hz
-    kpi_calculator = KpiCalculator(channel_model, sector_etilts, bs_tx_power_w, noise_power_w)
+    bs_xy = topology.bs_loc[0, :, :2].detach()
+    large_scale_channel = LargeScaleChannel(channel_model)
+    kpi_calculator = KpiManager(sector_etilts, bs_tx_power_w, noise_power_w, bs_xy)
 
     ut_orientations = torch.zeros(MAX_REALIZATION_CUDA, NUM_UT, 3,
                                   dtype=topology.bs_loc.dtype, device=topology.bs_loc.device)
     ut_velocities = torch.zeros_like(ut_orientations)
     in_state = torch.zeros(MAX_REALIZATION_CUDA, NUM_UT, dtype=torch.bool, device=topology.bs_loc.device)
 
-    return topology, channel_model, kpi_calculator, ut_orientations, ut_velocities, in_state
+    return topology, channel_model, large_scale_channel, kpi_calculator, ut_orientations, ut_velocities, in_state
 
 
 def build_mobility_list(topology, min_speed, max_speed):
@@ -153,7 +157,7 @@ def build_mobility_list(topology, min_speed, max_speed):
     pattern."""
     mobility_list = []
     for _ in range(NUM_REALIZATIONS_PER_SLOT):
-        start_xy_list = sample_cluster_start_xy(topology, NUM_GROUPS)
+        start_xy_list = sample_cluster_center_across_sites(topology, NUM_GROUPS)
         deviation_radius = DEVIATION_RADIUS_FRAC_AREA * topology.default_drop_radius
         initial_ut_loc, member_group_idx = sample_clustered_ut_loc(
             topology, start_xy_list, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT,
@@ -168,10 +172,10 @@ def build_mobility_list(topology, min_speed, max_speed):
     return mobility_list
 
 
-def build_power_table_slot(topology, mobility_list, channel_model, kpi_calculator,
+def build_power_table_slot(topology, mobility_list, channel_model, large_scale_channel, kpi_calculator,
                            ut_orientations, ut_velocities, in_state):
-    """One slot's pooled [num_tilts, num_sectors, NUM_REALIZATIONS_PER_SLOT*NUM_UT]
-    power table, from every realization's CURRENT position."""
+    """One slot's pooled [num_tilts, NUM_REALIZATIONS_PER_SLOT, num_sectors,
+    NUM_UT] power table, from every realization's CURRENT position."""
     num_chunks = NUM_REALIZATIONS_PER_SLOT // MAX_REALIZATION_CUDA
     chunks = []
     for chunk in range(num_chunks):
@@ -182,12 +186,12 @@ def build_power_table_slot(topology, mobility_list, channel_model, kpi_calculato
             ut_loc, topology.bs_loc, ut_orientations, topology.bs_orientations,
             ut_velocities, in_state, None, bs_virtual_loc,
         )
-        state = kpi_calculator.generate_large_scale_state()
-        chunks.append(kpi_calculator.compute_power_table(DOWNTILT_SWEEP_DEG, state))
-    return np.concatenate(chunks, axis=2)
+        state = large_scale_channel.generate_state()
+        chunks.append(kpi_calculator.compute_tilt_sector_ue_rx_power(state, DOWNTILT_SWEEP_DEG))
+    return np.concatenate(chunks, axis=1)
 
 
-def run_speed_setting(topology, channel_model, kpi_calculator, ut_orientations, ut_velocities, in_state,
+def run_speed_setting(topology, channel_model, large_scale_channel, kpi_calculator, ut_orientations, ut_velocities, in_state,
                       min_speed, max_speed, num_bs):
     """Per-slot oracle coverage/tilt history, plus per-candidate windowed
     coverage/tilt history (broadcast across each window's own slots, so
@@ -204,7 +208,7 @@ def run_speed_setting(topology, channel_model, kpi_calculator, ut_orientations, 
         for offset in range(MEGA_CHUNK_SLOTS):
             slot = chunk_start + offset
             power_table = build_power_table_slot(
-                topology, mobility_list, channel_model, kpi_calculator,
+                topology, mobility_list, channel_model, large_scale_channel, kpi_calculator,
                 ut_orientations, ut_velocities, in_state,
             )
             chunk_power_tables.append(power_table)
@@ -212,9 +216,9 @@ def run_speed_setting(topology, channel_model, kpi_calculator, ut_orientations, 
             oracle_assignment = LocalTiltSelector(max_rounds=COORDINATE_ASCENT_MAX_ROUNDS).select(
                 kpi_calculator, power_table, COVERAGE_THRESHOLD_DB, warm_start=None
             )
-            oracle_coverage[slot] = kpi_calculator.coverage_from_assignment(
+            oracle_coverage[slot] = kpi_calculator.compute_ue_kpis(
                 power_table, oracle_assignment, COVERAGE_THRESHOLD_DB
-            )
+            )["coverage"]
             oracle_tilt_deg_history[slot] = np.asarray(DOWNTILT_SWEEP_DEG)[oracle_assignment]
 
             if slot + 1 < NUM_SLOTS:
@@ -229,13 +233,13 @@ def run_speed_setting(topology, channel_model, kpi_calculator, ut_orientations, 
         for w in CANDIDATE_WINDOW_SLOTS:
             for window_start in range(0, MEGA_CHUNK_SLOTS, w):
                 window_tables = chunk_power_tables[window_start:window_start + w]
-                pooled_table = np.concatenate(window_tables, axis=2)
+                pooled_table = np.concatenate(window_tables, axis=1)
                 windowed_assignment = LocalTiltSelector(max_rounds=COORDINATE_ASCENT_MAX_ROUNDS).select(
                     kpi_calculator, pooled_table, COVERAGE_THRESHOLD_DB, warm_start=None
                 )
-                pooled_coverage = kpi_calculator.coverage_from_assignment(
+                pooled_coverage = kpi_calculator.compute_ue_kpis(
                     pooled_table, windowed_assignment, COVERAGE_THRESHOLD_DB
-                )
+                )["coverage"]
                 tilt_deg = np.asarray(DOWNTILT_SWEEP_DEG)[windowed_assignment]
                 abs_start = chunk_start + window_start
                 windowed_coverage[w][abs_start:abs_start + w] = pooled_coverage
@@ -245,7 +249,7 @@ def run_speed_setting(topology, channel_model, kpi_calculator, ut_orientations, 
 
 
 def main():
-    topology, channel_model, kpi_calculator, ut_orientations, ut_velocities, in_state = configure_simulation()
+    topology, channel_model, large_scale_channel, kpi_calculator, ut_orientations, ut_velocities, in_state = configure_simulation()
     num_bs = topology.num_bs
     print(f"Device={DEVICE}; {NUM_UT} UEs, {num_bs} sectors; {NUM_SLOTS} slots x {MEASUREMENT_INTERVAL_S:g} s; "
          f"candidate windows (slots)={CANDIDATE_WINDOW_SLOTS}")
@@ -266,7 +270,7 @@ def main():
         print(f"\n=== mobility speed setting: {name} "
              f"({setting['min_ut_speed']:g}-{setting['max_ut_speed']:g} m/s) ===")
         oracle_coverage, oracle_tilt_deg_history, windowed_coverage, windowed_tilt_deg_history = run_speed_setting(
-            topology, channel_model, kpi_calculator, ut_orientations, ut_velocities, in_state,
+            topology, channel_model, large_scale_channel, kpi_calculator, ut_orientations, ut_velocities, in_state,
             setting["min_ut_speed"], setting["max_ut_speed"], num_bs,
         )
 

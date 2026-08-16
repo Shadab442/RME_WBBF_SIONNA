@@ -28,9 +28,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import sionna
 from sionna.phy.channel.utils import set_3gpp_scenario_parameters
 from helpers.cellular_topology import CellularTopology
-from helpers.config import load_config
 from helpers.ue_drop import sample_uniform_ut_loc, sample_clustered_ut_loc, sample_valid_offset
-from helpers.scenario_view import save_scenario, plot_scenario, add_cluster_ellipses, compute_cell_colors
+from helpers.utils import load_config, save_scenario, plot_scenario, add_cluster_ellipses, compute_cell_colors
 from helpers.mobility import ReferencePointGroupMobility, RandomWalkMobility
 
 sionna.phy.config.seed = 42
@@ -40,27 +39,27 @@ sionna.phy.config.device = "cpu"  # pure geometry, no channel computation -- CPU
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "verifications", "mobility")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-CFG = load_config("verify_mobility")
+CFG = load_config()
 
 # parameters
-SCENARIO = CFG["scenario"]
-NUM_RINGS = CFG["num_rings"]
-NUM_UT = CFG["num_ut"]
-UT_HEIGHT = CFG["ut_height"]  # m
+SCENARIO = CFG["topology"]["scenario"]
+NUM_RINGS = CFG["topology"]["num_rings"]
+NUM_UT = CFG["topology"]["num_ut"]
+UT_HEIGHT = CFG["topology"]["ut_height"]  # m
 
 # Mobility parameters. NUM_GROUPS (60) exceeds the number of sites (7, at 1
 # ring), so clusters can't be pinned one-per-site -- see the per-site uniform
 # scatter below instead, which gives every cell a controlled, roughly-even
 # share of clusters rather than one.
-NUM_GROUPS = CFG["num_groups"]
+NUM_GROUPS = CFG["mobility"]["num_groups"]
 MEMBERS_PER_GROUP = NUM_UT // NUM_GROUPS
-DEVIATION_RADIUS_FRAC_AREA = CFG["deviation_radius_frac_area"]
-MEMBER_JITTER_SPEED = CFG["member_jitter_speed"]  # m/s
-MIN_SPEED, MAX_SPEED = CFG["min_ut_speed"], CFG["max_ut_speed"]  # m/s
+DEVIATION_RADIUS_FRAC_AREA = CFG["mobility"]["deviation_radius_frac_area"]
+MEMBER_JITTER_SPEED = CFG["mobility"]["member_jitter_speed"]  # m/s
+MIN_SPEED, MAX_SPEED = CFG["mobility"]["min_ut_speed"], CFG["mobility"]["max_ut_speed"]  # m/s
 
 # Simulation time parameters
-SLOT_DURATION = CFG["measurement_interval_s"]  # s
-NUM_SLOTS = CFG["num_slots"]  # quick visual check, not a full study
+SLOT_DURATION = CFG["simulation"]["measurement_interval_s"]  # s
+NUM_SLOTS = 120  # quick visual check, not a full study
 
 # Cellular site/sector topology 
 min_bs_ut_dist, isd, bs_height, min_ut_height, max_ut_height, indoor_probability, \
@@ -137,6 +136,28 @@ save_scenario(
 print(f"Saved: {out_path}")
 
 
+class _MobilityStepAnimationUpdater:
+    """FuncAnimation callback (frame -> updated artists) for make_animation
+    -- a class instead of a closure so per-frame state lives as attributes,
+    not captured locals. Advances mobility by dt itself each call."""
+
+    def __init__(self, mobility, dt, scatter, ellipses):
+        self.mobility = mobility
+        self.dt = dt
+        self.scatter = scatter
+        self.ellipses = ellipses
+
+    def __call__(self, _frame):
+        self.mobility.step(self.dt)
+        self.scatter.set_offsets(self.mobility.ut_loc[:, :2].detach().cpu().numpy())
+        artists = [self.scatter]
+        if self.ellipses is not None:
+            for patch, (cx, cy) in zip(self.ellipses, self.mobility.ref_xy.numpy()):
+                patch.set_center((float(cx), float(cy)))
+            artists.extend(self.ellipses)
+        return artists
+
+
 def make_animation(mobility, num_slots, dt, out_path, title, cluster_radius=None, colors=None):
     """cluster_radius, if given, draws and updates one circle per cluster
     each frame from mobility.ref_xy (RPGM only -- RandomWalkMobility has no
@@ -157,16 +178,7 @@ def make_animation(mobility, num_slots, dt, out_path, title, cluster_radius=None
     if cluster_radius is not None:
         ellipses = add_cluster_ellipses(ax, mobility.ref_xy.numpy(), cluster_radius)
 
-    def update(_frame):
-        mobility.step(dt)
-        scatter.set_offsets(mobility.ut_loc[:, :2].detach().cpu().numpy())
-        artists = [scatter]
-        if ellipses is not None:
-            for patch, (cx, cy) in zip(ellipses, mobility.ref_xy.numpy()):
-                patch.set_center((float(cx), float(cy)))
-            artists.extend(ellipses)
-        return artists
-
+    update = _MobilityStepAnimationUpdater(mobility, dt, scatter, ellipses)
     anim = FuncAnimation(fig, update, frames=num_slots, blit=False)
     anim.save(out_path, writer=PillowWriter(fps=10))
     plt.close(fig)

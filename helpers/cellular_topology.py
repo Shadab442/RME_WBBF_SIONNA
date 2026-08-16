@@ -1,8 +1,4 @@
-# Hex-grid BS site/sector layout (via Sionna's own sionna.sys.topology.HexGrid),
-# plus the coverage-boundary utilities derived from it. UE placement (uniform or
-# clustered) is a separate, pluggable concern -- see helpers/ue_drop.py -- since
-# a site layout is needed regardless of how UEs get placed on top of it.
-
+# Hex-grid BS site/sector layout (a thing wrapper around sionna.sys.topology.HexGrid),
 import math
 
 import torch
@@ -14,11 +10,7 @@ NUM_SECTORS_PER_SITE = 3  # same 120-degree, 3-sector-per-site convention used t
 
 
 class CellularTopology:
-    """BS site/sector placement, plus the coverage-boundary tests derived
-    from it (``is_within_coverage``, ``default_drop_radius``,
-    ``mirror_bs_loc``). Contains no UE-placement logic itself -- see
-    helpers/ue_drop.py for that (uniform or clustered drops, both built on
-    top of this class).
+    """BS site/sector placement
 
     :ivar grid: the underlying :class:`~sionna.sys.topology.HexGrid`.
     :ivar bs_loc: [batch_size, num_bs, 3]. BS/sector positions [m].
@@ -39,25 +31,26 @@ class CellularTopology:
         device=None,
     ):
         """
-        :param scenario_params: dict with "isd", "bs_height", and
-            "min_bs_ut_dist" torch scalars (subset of
-            set_3gpp_scenario_parameters's output).
+        :param scenario_params: "isd", "bs_height", "min_bs_ut_dist" 
         :param num_rings: HexGrid rings (1 ring = 7 sites).
         :param num_sectors_per_site: sectors co-located at each site.
         :param batch_size: batch dimension for bs_loc/bs_orientations.
         """
+        # Assertion check for 3 sector site
         assert num_sectors_per_site == 3, (
             "sector_yaws below hardcodes the standard 3-sector, 120-degree "
             "boresight convention (60/180/300 deg); a different "
             "num_sectors_per_site would need a different yaw formula."
         )
+
+        # Read input parameters
         self.num_sectors_per_site = num_sectors_per_site
         self.batch_size = batch_size
         self.min_bs_ut_dist = scenario_params["min_bs_ut_dist"]
-
         isd = scenario_params["isd"]
         bs_height = scenario_params["bs_height"]
 
+        # Create hexagonal cellular grid
         self.grid = HexGrid(
             isd=isd.item(),
             cell_height=bs_height.item(),
@@ -101,11 +94,7 @@ class CellularTopology:
 
     def is_within_coverage(self, xy: torch.Tensor) -> torch.Tensor:
         """True for points that lie within their nearest site's actual
-        hexagon -- not just the circumscribing `default_drop_radius` disk,
-        which bulges past the hexagon edges in the gaps between cells.
-        Used by helpers/ue_drop.py's rejection sampling, and by
-        helpers/mobility.py so mobility models stay inside the same real
-        footprint instead of a circular approximation of it.
+        hexagon -- not just within the `default_drop_radius` disk,
 
         :param xy: [N, 2] candidate (x, y) positions [m].
         :output: [N] bool tensor.
@@ -116,14 +105,8 @@ class CellularTopology:
         dist_to_sites = torch.linalg.norm(xy[:, None, :] - site_loc[None, :, :], dim=-1)
         nearest_dist, nearest_idx = dist_to_sites.min(dim=-1)
 
-        # A hexagon's boundary distance varies with angle (closer at flat
-        # edges, farther at corners), unlike a circle. Sionna's own
-        # Hexagon.corners() places vertices at angle = k*60deg (0, 60, 120,
-        # ...), so the boundary is at its maximum (= cell_radius, the
-        # circumradius) exactly at those angles and at its minimum
-        # (apothem) at the midpoints (30, 90, 150, ...) -- offset=0 must
-        # land on the midpoints for the cos(offset) formula below to peak
-        # at the vertices.
+        # Hex boundary radius varies with angle: 
+        # largest at vertices, smallest at edge midpoints.
         delta = xy - site_loc[nearest_idx]
         angle = torch.atan2(delta[:, 1], delta[:, 0])
         offset = torch.remainder(angle, math.pi / 3.0) - math.pi / 6.0
@@ -131,11 +114,8 @@ class CellularTopology:
         return nearest_dist <= hex_boundary
 
     def mirror_bs_loc(self, ut_loc: torch.Tensor) -> torch.Tensor:
-        """Wraparound-corrected BS positions per UE:
-        for each site, picks whichever of its 6 mirror images
-        or itself is closest to a given UE, so edge UEs see interference
-        as if the grid tiled infinitely instead of stopping at the drop
-        boundary.
+        """Wraparound topology: 
+        use the nearest mirror of each BS site for every UE to avoid edge effects.
 
         :param ut_loc: [batch_size, num_ut, 3].
         :output bs_virtual_loc: [batch_size, num_bs, num_ut, 3]. Feeds

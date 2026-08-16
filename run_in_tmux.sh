@@ -4,8 +4,8 @@
 # regardless of whether your client is still connected to it.
 #
 # Usage:
-#   ./run_in_tmux.sh scripts/tests/test_dynamic_global_tilts_effect.py
-#   ./run_in_tmux.sh scripts/tests/test_dynamic_global_tilts_effect.py --some-arg   # extra args pass through
+#   ./run_in_tmux.sh main.py
+#   ./run_in_tmux.sh main.py --some-arg   # extra args pass through
 #
 # Then:
 #   tmux attach -t <session_name>   # reattach and watch it live

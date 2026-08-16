@@ -35,14 +35,7 @@ class IndependentDqn(TiltPolicy):
         device: str = "cpu",
     ):
         """
-        :param algorithm_seed: seeds EVERYTHING algorithm-side (network
-            weight init via torch.manual_seed, called once here right
-            before constructing the networks -- safe because environment
-            draws never touch the global torch RNG, see
-            helpers/tilt_environment.py -- plus a dedicated random.Random
-            instance, NOT Python's global `random` module, for
-            epsilon-greedy exploration and replay sampling). Fully separate
-            from and independent of the environment's own seed.
+        :param algorithm_seed: seeds EVERYTHING algorithm-side
         """
         super().__init__()
         self.num_sectors = num_sectors
@@ -58,10 +51,7 @@ class IndependentDqn(TiltPolicy):
         self.device = device
         self.steps = 0
 
-        # One shared dedicated rng for all algorithm-side Python-level
-        # randomness (epsilon-greedy choices + every sector's replay
-        # sampling) -- reproducible because sectors are always iterated in
-        # the same fixed order, never Python's global `random` module.
+        # One shared dedicated rng for all algorithm-side 
         self.rng = random.Random(algorithm_seed)
 
         torch.manual_seed(algorithm_seed)

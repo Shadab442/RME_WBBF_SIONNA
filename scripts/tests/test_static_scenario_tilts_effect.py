@@ -3,7 +3,7 @@ differ from sector to sector, for a static (non-mobile) UE population?
 
 UEs are dropped in clusters (same generative model as
 test_dynamic_scenario_tilts_effect.py's RPGM population: NUM_GROUPS clusters
-split evenly across sites via helpers.ue_drop.sample_cluster_start_xy, each
+split evenly across sites via helpers.ue_drop.sample_cluster_center_across_sites, each
 cluster's members within DEVIATION_RADIUS_FRAC_AREA of its center), not
 uniformly at random -- so this script's population matches the mobility
 script's population structure exactly, just held at one snapshot instead of
@@ -23,13 +23,13 @@ best-serving-sector SINR > COVERAGE_THRESHOLD_DB):
   tilt" is always an available move each round.
 
 Both assignments are evaluated off a single shared power table
-(helpers.kpi_calculator.KpiCalculator.compute_power_table): each candidate
-tilt is swept once (applied to every sector, exactly like a normal tilt
-sweep) and each sector's own row kept, since a sector's received power
+(helpers.kpi_manager.KpiManager.compute_tilt_sector_ue_rx_power): each
+candidate tilt is swept once (applied to every sector, exactly like a normal
+tilt sweep) and each sector's own row kept, since a sector's received power
 depends only on its own antenna weights and the channel to each UE -- never
 on any other sector's tilt. Any per-sector assignment can then be evaluated
-by array lookup alone (KpiCalculator.coverage_from_assignment), no repeated
-channel computation.
+by array lookup alone (KpiManager.compute_ue_kpis), no repeated channel
+computation.
 
 This script only computes and saves data (results/tests/static_scenario_tilts_effect/
 data.npz, plus scenario.png) -- run plot_static_scenario_tilts_effect.py
@@ -51,11 +51,11 @@ from sionna.phy.constants import BOLTZMANN_CONSTANT
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from helpers.cellular_topology import CellularTopology
-from helpers.config import load_config
-from helpers.ue_drop import sample_cluster_start_xy, sample_clustered_ut_loc
-from helpers.scenario_view import save_scenario, compute_cell_colors
+from helpers.ue_drop import sample_cluster_center_across_sites, sample_clustered_ut_loc
+from helpers.utils import load_config, save_scenario, compute_cell_colors
 from helpers.electrical_downtilt import ElectricalDowntilt
-from helpers.kpi_calculator import KpiCalculator
+from helpers.kpi_manager import KpiManager
+from helpers.large_scale_channel import LargeScaleChannel
 from helpers.tilt_controller import GlobalTiltSelector, LocalTiltSelector
 
 sionna.phy.config.seed = 42
@@ -66,32 +66,34 @@ sionna.phy.config.device = DEVICE
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "tests", "static_scenario_tilts_effect")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-CFG = load_config("test_static_scenario_tilts_effect")
+CFG = load_config()
 
 # parameters
-CARRIER_FREQUENCY = CFG["carrier_frequency"]  # Hz -- n78 FR1 mid-band
-SCENARIO = CFG["scenario"]
-NUM_RINGS = CFG["num_rings"]  # matches the mobility scripts
-NUM_UT = CFG["num_ut"]  # total UEs
-UT_HEIGHT = CFG["ut_height"]  # m
+CARRIER_FREQUENCY = CFG["channel"]["carrier_frequency"]  # Hz -- n78 FR1 mid-band
+SCENARIO = CFG["topology"]["scenario"]
+NUM_RINGS = CFG["topology"]["num_rings"]  # matches the mobility scripts
+NUM_UT = CFG["topology"]["num_ut"]  # total UEs
+UT_HEIGHT = CFG["topology"]["ut_height"]  # m
 # Clustered population -- same values as test_dynamic_scenario_tilts_effect.py,
 # so the two scripts' populations only differ in whether they move over time.
-NUM_GROUPS = CFG["num_groups"]
+NUM_GROUPS = CFG["mobility"]["num_groups"]
 MEMBERS_PER_GROUP = NUM_UT // NUM_GROUPS
-DEVIATION_RADIUS_FRAC_AREA = CFG["deviation_radius_frac_area"]
-M = CFG["m"]  # elements per sector antenna array
-ANTENNA_WINDOW = CFG["antenna_window"]
-BS_TX_POWER_DBM = CFG["bs_tx_power_dbm"]
-CHANNEL_BANDWIDTH_PRB = CFG["channel_bandwidth_prb"]  # ~20 MHz @ 30 kHz SCS
-TEMPERATURE = CFG["temperature"]  # K
-DOWNTILT_SWEEP_DEG = CFG["downtilt_sweep_deg"]
-TOTAL_REALIZATIONS = CFG["total_realizations"]  # total independent (topology, channel) draws pooled together
-MAX_REALIZATION_CUDA = CFG["max_realization_cuda"]
+DEVIATION_RADIUS_FRAC_AREA = CFG["mobility"]["deviation_radius_frac_area"]
+M = CFG["antenna"]["m"]  # elements per sector antenna array
+ANTENNA_WINDOW = CFG["antenna"]["antenna_window"]
+BS_TX_POWER_DBM = CFG["channel"]["bs_tx_power_dbm"]
+CHANNEL_BANDWIDTH_PRB = CFG["channel"]["channel_bandwidth_prb"]  # ~20 MHz @ 30 kHz SCS
+TEMPERATURE = CFG["channel"]["temperature"]  # K
+DOWNTILT_SWEEP_DEG = CFG["antenna"]["downtilt_sweep_deg"]
+# Same knob as the dynamic scenario's realizations-per-slot -- a static
+# snapshot is just one slot's worth of pooled realizations.
+TOTAL_REALIZATIONS = CFG["simulation"]["num_realizations_per_slot"]
+MAX_REALIZATION_CUDA = CFG["simulation"]["max_realization_cuda"]
 # Coverage objective's threshold -- this drives the tilt SEARCH itself (both
 # baselines maximize coverage AT this threshold), unlike plot-only
 # tunables (e.g. moving-average windows) that only affect display.
-COVERAGE_THRESHOLD_DB = CFG["coverage_threshold_db"]
-COORDINATE_ASCENT_MAX_ROUNDS = CFG["coordinate_ascent_max_rounds"]
+COVERAGE_THRESHOLD_DB = CFG["kpi"]["coverage_threshold_db"]
+COORDINATE_ASCENT_MAX_ROUNDS = CFG["algorithms"]["optimization"]["coordinate_ascent_max_rounds"]
 
 assert TOTAL_REALIZATIONS % MAX_REALIZATION_CUDA == 0, \
     "TOTAL_REALIZATIONS must be a multiple of MAX_REALIZATION_CUDA"
@@ -120,7 +122,7 @@ def sample_clustered_ut_loc_batch(batch_size):
     independent uniform snapshot per batch element."""
     ut_locs = []
     for _ in range(batch_size):
-        start_xy_list = sample_cluster_start_xy(topo, NUM_GROUPS)
+        start_xy_list = sample_cluster_center_across_sites(topo, NUM_GROUPS)
         ut_loc_b, _ = sample_clustered_ut_loc(
             topo, start_xy_list, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT,
             dtype=topo.bs_loc.dtype, device=topo.bs_loc.device,
@@ -138,7 +140,7 @@ in_state = torch.zeros(MAX_REALIZATION_CUDA, NUM_UT, dtype=torch.bool,
 
 # Representative snapshot for the scenario.png setup plot -- the pooled
 # sweep below draws its own fresh clustered UE positions every chunk.
-_snapshot_start_xy = sample_cluster_start_xy(topo, NUM_GROUPS)
+_snapshot_start_xy = sample_cluster_center_across_sites(topo, NUM_GROUPS)
 _snapshot_ut_loc, _snapshot_member_group_idx = sample_clustered_ut_loc(
     topo, _snapshot_start_xy, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT,
     dtype=topo.bs_loc.dtype, device=topo.bs_loc.device,
@@ -170,15 +172,17 @@ channel_model = channel_model_cls(**channel_model_kwargs)
 bs_tx_power_w = 10 ** ((BS_TX_POWER_DBM - 30) / 10)
 channel_bandwidth_hz = CHANNEL_BANDWIDTH_PRB * 12 * 30e3  # 30 kHz SCS
 noise_power_w = BOLTZMANN_CONSTANT * TEMPERATURE * channel_bandwidth_hz
+bs_xy = topo.bs_loc[0, :, :2].detach()
 
-kpi_calc = KpiCalculator(channel_model, sector_etilts, bs_tx_power_w, noise_power_w)
+large_scale_channel = LargeScaleChannel(channel_model)
+kpi_calc = KpiManager(sector_etilts, bs_tx_power_w, noise_power_w, bs_xy)
 
 
 def build_power_table_crn(tilt_values, total_realizations, max_realization_cuda):
-    """Pooled [num_tilts, num_sectors, total_realizations*num_ue] power
+    """Pooled [num_tilts, total_realizations, num_sectors, num_ue] power
     table -- fresh clustered UE positions and channel every chunk,
-    concatenated along the sample axis (a plain tilt sweep at every chunk,
-    per helpers.kpi_calculator.KpiCalculator.compute_power_table)."""
+    concatenated along the batch axis (a plain tilt sweep at every chunk,
+    per helpers.kpi_manager.KpiManager.compute_tilt_sector_ue_rx_power)."""
     num_chunks = total_realizations // max_realization_cuda
     chunks = []
     for chunk_idx in range(num_chunks):
@@ -187,18 +191,18 @@ def build_power_table_crn(tilt_values, total_realizations, max_realization_cuda)
         channel_model.set_topology(new_ut_loc, topo.bs_loc, ut_orientations,
                                    topo.bs_orientations, ut_velocities, in_state,
                                    None, new_bs_virtual_loc)
-        state = kpi_calc.generate_large_scale_state()
-        chunks.append(kpi_calc.compute_power_table(tilt_values, state))
-    return np.concatenate(chunks, axis=2)
+        state = large_scale_channel.generate_state()
+        chunks.append(kpi_calc.compute_tilt_sector_ue_rx_power(state, tilt_values))
+    return np.concatenate(chunks, axis=1)
 
 
 power_table = build_power_table_crn(DOWNTILT_SWEEP_DEG, TOTAL_REALIZATIONS, MAX_REALIZATION_CUDA)
-print(f"Power table: {power_table.shape} (tilts x sectors x pooled samples)")
+print(f"Power table: {power_table.shape} (tilts x batch x sectors x ue)")
 
 global_selector = GlobalTiltSelector()
 init_assignment = global_selector.select(kpi_calc, power_table, COVERAGE_THRESHOLD_DB)
 static_global_tilt_idx = int(init_assignment[0])
-global_coverage = kpi_calc.coverage_from_assignment(power_table, init_assignment, COVERAGE_THRESHOLD_DB)
+global_coverage = kpi_calc.compute_ue_kpis(power_table, init_assignment, COVERAGE_THRESHOLD_DB)["coverage"]
 print(f"Static Global: {DOWNTILT_SWEEP_DEG[static_global_tilt_idx]:g}° "
      f"-> coverage={global_coverage:.4f}")
 
@@ -213,14 +217,12 @@ print(f"Static Local: converged after {num_rounds} round(s) "
      f"({'converged' if converged else 'hit max_rounds, may not have converged'}) "
      f"-> coverage={local_coverage:.4f} (gap over Global: {local_coverage - global_coverage:+.4f})")
 
-global_coverage_check, sinr_db_global, serving_idx_global = kpi_calc.coverage_from_assignment(
-    power_table, init_assignment, COVERAGE_THRESHOLD_DB, return_details=True
-)
-local_coverage_check, sinr_db_local, serving_idx_local = kpi_calc.coverage_from_assignment(
-    power_table, local_tilt_idx_per_sector, COVERAGE_THRESHOLD_DB, return_details=True
-)
-assert np.isclose(global_coverage_check, global_coverage)
-assert np.isclose(local_coverage_check, local_coverage)
+global_kpis = kpi_calc.compute_ue_kpis(power_table, init_assignment, COVERAGE_THRESHOLD_DB)
+local_kpis = kpi_calc.compute_ue_kpis(power_table, local_tilt_idx_per_sector, COVERAGE_THRESHOLD_DB)
+sinr_db_global, serving_idx_global = global_kpis["sinr_db"], global_kpis["serving_idx"]
+sinr_db_local, serving_idx_local = local_kpis["sinr_db"], local_kpis["serving_idx"]
+assert np.isclose(global_kpis["coverage"], global_coverage)
+assert np.isclose(local_kpis["coverage"], local_coverage)
 
 per_sector_coverage_global = np.full(num_bs, np.nan)
 per_sector_coverage_local = np.full(num_bs, np.nan)

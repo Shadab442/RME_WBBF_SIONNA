@@ -2,7 +2,7 @@
 repo-local functions/topology.py / functions/simulation.py versions that
 used to exist here -- those added UE-placement constraints and a
 UE-plotting wrapper we don't need, and have since been deleted; see
-helpers/scenario_view.py for the one genuinely missing piece, UE
+helpers/utils.py for the one genuinely missing piece, UE
 plotting, added on top of Sionna's own HexGrid.show()).
 
 Run: python scripts/verifications/verify_topology.py
@@ -14,7 +14,7 @@ import sys
 from sionna.sys.topology import gen_hexgrid_topology
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-from helpers.scenario_view import save_scenario
+from helpers.utils import save_scenario
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "verifications", "topology")
 os.makedirs(OUT_DIR, exist_ok=True)

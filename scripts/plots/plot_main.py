@@ -1,10 +1,9 @@
-"""Plots for test_dynamic_scenario_tilts_effect.py -- loads
-results/tests/dynamic_scenario_tilts_effect/data.npz (no simulation/channel
+"""Plots for main.py -- loads results/main/data.npz (no simulation/channel
 computation here). One data point per TILT CONTROL INTERVAL (300 s by
-default), not per 1-second measurement draw -- see the test script's own
-docstring for the two-timescale structure.
+default), not per 1-second measurement draw -- see main.py's own docstring
+for the two-timescale structure.
 
-Saves to results/tests/dynamic_scenario_tilts_effect/:
+Saves to results/main/:
   1. coverage_vs_time.png       -- coverage over time, for whichever methods
                                     are listed in SHOW_METHODS below, last
                                     STEADY_STATE_EPISODES intervals shaded
@@ -25,7 +24,7 @@ Saves to results/tests/dynamic_scenario_tilts_effect/:
                                     episode -- no other method tracks this,
                                     so no comparison lines.
 
-Run: python scripts/plots/plot_dynamic_scenario_tilts_effect.py
+Run: python scripts/plots/plot_main.py
 """
 
 import os
@@ -33,7 +32,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "tests", "dynamic_scenario_tilts_effect")
+OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "main")
 
 # Coverage is already pooled over many UEs/realizations per interval, so
 # it's far less noisy than a single-interval median SINR, but a light
@@ -74,7 +73,7 @@ METHODS = {
 
 # sinr_percentiles_<method> is [len(SINR_PERCENTILES), num_intervals];
 # SINR_PERCENTILES gives the percentile each row is (e.g. [50, 5, 1] -- see
-# test_dynamic_scenario_tilts_effect.py).
+# main.py).
 SINR_PERCENTILES = data["sinr_percentiles"].tolist()
 SINR_LABEL = {50: "Median", 5: "5th-percentile", 1: "1st-percentile"}
 SINR_METHODS = {
@@ -123,7 +122,7 @@ ax.axvspan(steady_state_start_s, time_s[-1], color="gray", alpha=0.15,
 # Label y-positions start at each method's own steady-state mean, then get
 # nudged apart (preserving rank order) so close-together methods (e.g. DRL
 # vs. No Tilt) don't render as overlapping text.
-xlim_right = time_s[-1] + 0.22 * (time_s[-1] - time_s[0])
+xlim_right = time_s[-1] + 0.07 * (time_s[-1] - time_s[0])
 ax.set_xlim(time_s[0], xlim_right)
 label_specs = sorted(
     ((key, METHODS[key][1][steady].mean()) for key in SHOW_METHODS),
@@ -186,9 +185,16 @@ def save_sinr_percentile_plot(percentile, filename, label):
     print(f"Saved: {path}")
 
 
-save_sinr_percentile_plot(50, "median_sinr_vs_time.png", "Median")
-save_sinr_percentile_plot(5, "p5_sinr_vs_time.png", "5th-percentile")
-save_sinr_percentile_plot(1, "p1_sinr_vs_time.png", "1st-percentile")
+# Only the percentiles actually present in this run's data (kpi.sinr_percentiles
+# in config.yaml) -- e.g. a 1st-percentile plot is skipped if that config only
+# tracks [50, 5].
+for percentile, filename, label in [
+    (50, "median_sinr_vs_time.png", "Median"),
+    (5, "p5_sinr_vs_time.png", "5th-percentile"),
+    (1, "p1_sinr_vs_time.png", "1st-percentile"),
+]:
+    if percentile in SINR_PERCENTILES:
+        save_sinr_percentile_plot(percentile, filename, label)
 
 # --------------------- Dynamic Local Oracle tilt heatmap --------------------
 fig, ax = plt.subplots(figsize=(10, 6))

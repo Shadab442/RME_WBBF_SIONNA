@@ -42,7 +42,7 @@ class ReplayBuffer:
     never Python's global `random` module -- so algorithm-side randomness
     stays fully isolated and reproducible from an explicit seed, the same
     isolation principle used for the environment's own RNG
-    (helpers/tilt_environment.py).
+    (helpers/simulation_engine.py).
     """
 
     def __init__(self, capacity, rng):

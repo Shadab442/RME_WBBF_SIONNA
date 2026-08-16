@@ -1,7 +1,4 @@
-"""Pluggable initial UE-placement strategies, built on top of a CellularTopology.
-
-Both functions here only produce t=0 positions -- how those positions evolve
-over time (if at all) is a separate, later concern; see helpers/mobility.py.
+"""Initial UE-placement strategies, built on top of a CellularTopology.
 """
 
 import math
@@ -9,30 +6,30 @@ import math
 import torch
 
 
-def sample_disk_offset(radius: float, num_points: int, dtype, device, generator=None) -> torch.Tensor:
+def sample_disk_offset(radius: float, num_points: int, dtype, device, generator=None,
+                       angle_center: float = None, angle_half_width: float = None) -> torch.Tensor:
     """Uniform-random (x, y) offsets within a disk of the given radius --
-    r=R*sqrt(U), theta=2*pi*U, so area density is uniform."""
+    r=R*sqrt(U), so area density is uniform. theta is drawn over the full
+    circle by default, or restricted to the wedge
+    [angle_center - angle_half_width, angle_center + angle_half_width]
+    [rad] if both are given.
+    """
     r = radius * torch.sqrt(torch.rand(num_points, dtype=dtype, device=device, generator=generator))
-    theta = 2.0 * math.pi * torch.rand(num_points, dtype=dtype, device=device, generator=generator)
+    u = torch.rand(num_points, dtype=dtype, device=device, generator=generator)
+    if angle_center is None:
+        theta = 2.0 * math.pi * u
+    else:
+        theta = angle_center + angle_half_width * (2.0 * u - 1.0)
     return torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
 
 
 def sample_valid_offset(centers: torch.Tensor, radius: float, topology, dtype, device,
-                        generator=None, max_rounds: int = 100, min_dist_from_site: float = None) -> torch.Tensor:
-    """For each row in centers [N, 2], samples a random disk offset (radius)
+                        generator=None, max_rounds: int = 100, min_dist_from_site: float = None,
+                        angle_center: float = None, angle_half_width: float = None) -> torch.Tensor:
+    """For each row in centers [N, 2], samples a random disk offset (radius,
+    optionally restricted to an angular wedge -- see sample_disk_offset)
     such that centers[i] + offset lies within topology's real hex-grid
-    footprint (topology.is_within_coverage), rejecting and resampling
-    per-point as needed. Falls back to zero offset (stays at its center)
-    for any point still invalid after max_rounds, so this can never loop
-    forever regardless of how large radius is relative to the coverage area.
-
-    :param min_dist_from_site: if given, candidates within this distance of
-        ANY BS site are also rejected (3GPP's minimum BS-UT distance) --
-        needed whenever the result feeds directly into a channel
-        computation (an actual UE position), since near-zero BS-UT distance
-        blows up pathloss into inf/nan. Not needed for offsets that only
-        produce a cluster center or a waypoint destination -- those aren't
-        evaluated by the channel model themselves.
+    footprint, rejecting and resampling per-point as needed.
     """
     xy = centers.clone()
     valid = torch.zeros(centers.shape[0], dtype=torch.bool, device=device)
@@ -42,7 +39,8 @@ def sample_valid_offset(centers: torch.Tensor, radius: float, topology, dtype, d
         if valid.all():
             break
         pending = (~valid).nonzero(as_tuple=True)[0]
-        offsets = sample_disk_offset(radius, pending.shape[0], dtype, device, generator)
+        offsets = sample_disk_offset(radius, pending.shape[0], dtype, device, generator,
+                                     angle_center=angle_center, angle_half_width=angle_half_width)
         candidates = centers[pending] + offsets
         ok = topology.is_within_coverage(candidates)
         if min_dist_from_site is not None:
@@ -66,9 +64,7 @@ def sample_uniform_ut_loc(
     batch_size: int = None,
 ) -> torch.Tensor:
     """Uniformly-at-random (x, y) UE drop, at a fixed height, over the
-    hex-grid's actual coverage footprint -- the union of every site's
-    hexagon, not just a circumscribing disk (which bulges past the hexagon
-    edges in the gaps between cells).
+    hex-grid's coverage footprint 
 
     Candidates are drawn uniformly over a disk (``r = R*sqrt(U)``,
     ``theta = 2*pi*U``, so area density is uniform), then rejected and
@@ -82,10 +78,7 @@ def sample_uniform_ut_loc(
     :param disk_radius: circumscribing disk to draw candidates from;
         defaults to ``topology.default_drop_radius``.
     :param batch_size: if given, draws this many independent drops and
-        stacks them into ``[batch_size, num_ut, 3]`` -- e.g. for a
-        common-random-numbers study where several independent
-        (topology, channel) realizations are evaluated as one batch.
-        If `None` (default), returns a single drop ``[num_ut, 3]``.
+        stacks them into ``[batch_size, num_ut, 3]`` 
     :output ut_loc: ``[num_ut, 3]``, or ``[batch_size, num_ut, 3]`` if
         ``batch_size`` is given.
     """
@@ -139,12 +132,7 @@ def sample_uniform_ut_loc(
 def sample_grid_points(topology, spacing: float, ut_height: float, dtype, device,
                        disk_radius: float = None) -> torch.Tensor:
     """Deterministic regular (x, y) grid spanning the hex-grid's real
-    coverage footprint, at fixed height -- same two validity checks as
-    sample_uniform_ut_loc (within the actual footprint, at least
-    min_bs_ut_dist from every site), but a fixed lattice instead of random
-    samples. Meant for helpers/radio_map.py, where grid points stand in
-    for "UEs" whose channel gets computed once and reused, rather than for
-    an actual UE population.
+    coverage footprint, at fixed height.
 
     :param spacing: grid spacing [m] along both x and y.
     :param disk_radius: bounding disk the lattice is generated over before
@@ -173,30 +161,40 @@ def sample_grid_points(topology, spacing: float, ut_height: float, dtype, device
     return torch.cat([kept, z], dim=-1)  # [num_grid_points, 3]
 
 
-def sample_cluster_start_xy(topology, num_groups: int, generator=None):
+def sample_cluster_center_across_sites(topology, num_groups: int, generator=None):
     """``num_groups`` cluster-center (x, y) positions, split as evenly as
-    possible across ``topology``'s sites (so a large ``num_groups`` doesn't
-    collapse onto a handful of sites by chance), each placed uniformly at
-    random within its own site's cell footprint (a disk of the site's hex
-    circumradius, rejected against the real coverage footprint).
-
-    Feed the result straight into ``sample_clustered_ut_loc`` as
-    ``cluster_centers``.
+    possible across ``topology``'s sites, then -- within each site -- split
+    as evenly as possible again across its ``num_sectors_per_site`` sectors,
+    each cluster placed uniformly at random within its own sector's 120 deg
+    wedge of the site's cell footprint (not anywhere in the site, which
+    would leave sector balance uncontrolled).
     """
     num_cells = topology.num_cells
+    num_sectors_per_site = topology.num_sectors_per_site
     base, extra = divmod(num_groups, num_cells)
     clusters_per_site = [base + 1 if site_idx < extra else base for site_idx in range(num_cells)]
     cell_radius = float(topology.grid.cell_radius.item())
+    wedge_half_width = math.pi / num_sectors_per_site
     start_xy_list = []
     for site_idx, n_clusters in enumerate(clusters_per_site):
         if n_clusters == 0:
             continue
-        site_center = topology.site_loc[site_idx:site_idx + 1].expand(n_clusters, -1)
-        cluster_xy = sample_valid_offset(
-            site_center, cell_radius, topology,
-            topology.bs_loc.dtype, topology.bs_loc.device, generator,
-        )
-        start_xy_list.extend(tuple(xy) for xy in cluster_xy.tolist())
+        sector_base, sector_extra = divmod(n_clusters, num_sectors_per_site)
+        clusters_per_sector = [sector_base + 1 if k < sector_extra else sector_base
+                               for k in range(num_sectors_per_site)]
+        sector_yaws = topology.bs_orientations[0, site_idx * num_sectors_per_site:
+                                               (site_idx + 1) * num_sectors_per_site, 0]
+        site_center = topology.site_loc[site_idx]
+        for k, n_sector_clusters in enumerate(clusters_per_sector):
+            if n_sector_clusters == 0:
+                continue
+            centers = site_center.unsqueeze(0).expand(n_sector_clusters, -1)
+            cluster_xy = sample_valid_offset(
+                centers, cell_radius, topology,
+                topology.bs_loc.dtype, topology.bs_loc.device, generator,
+                angle_center=float(sector_yaws[k]), angle_half_width=wedge_half_width,
+            )
+            start_xy_list.extend(tuple(xy) for xy in cluster_xy.tolist())
     return start_xy_list
 
 
@@ -212,8 +210,7 @@ def sample_clustered_ut_loc(
 ):
     """UEs dropped in clusters around given center points, each member a
     random offset (within deviation_radius) from its own cluster's center,
-    rejection-sampled against the real hex-grid footprint (never just a
-    circular approximation of it).
+    rejection-sampled against the real hex-grid footprint.
 
     :param topology: a :class:`~helpers.cellular_topology.CellularTopology`.
     :param cluster_centers: [num_clusters, 2] (x, y) cluster center points.

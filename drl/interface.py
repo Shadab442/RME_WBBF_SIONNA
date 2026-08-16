@@ -1,16 +1,15 @@
 """Environment-side RL interface: state/reward construction and action
 interpretation -- the contract between the environment
-(helpers/tilt_environment.py) and any policy (drl/factory.py).
+(helpers/simulation_engine.py) and any policy (drl/factory.py).
 
 Named/typed so a new state or reward formulation is a new branch here plus
 a config value (state_type / reward_type), not an edit to whatever script
 is running the comparison. Mirrors drl/factory.py's create_policy(name, ...)
 pattern for the same reason.
 
-Distinct from helpers.tilt_environment.compute_per_sector_coverage_overshoot:
-that computes raw per-sector KPIs (coverage fraction, overshoot fraction) --
-general-purpose measurements (AdaptiveLegacyTiltController computes its own
-version of the same thing inline, for its own crisp-threshold decision).
+Distinct from helpers.kpi_manager.KpiManager.compute_ue_kpis: that computes
+raw per-sector KPIs (coverage fraction, overshoot fraction) -- general-
+purpose measurements shared by DRL and AdaptiveLegacyTiltController alike.
 This module turns those raw KPIs into an RL-specific state vector and
 scalar reward, which is what's actually DRL-specific -- not the KPIs
 themselves.

@@ -1,105 +1,72 @@
-# Shared configuration for all test/verify/plot scripts.
-# `common` holds parameters shared across scripts. Each other top-level key
-# is a script's own name; its values override/extend `common` for that
-# script only. Unused keys in a section are harmless.
-
-common:
-  carrier_frequency: 3.5e+9     # Hz, n78 FR1 mid-band
+topology:
   scenario: umi
   num_rings: 1
   num_ut: 300
   ut_height: 1.5                # m
+
+antenna:
   m: 8                          # vertical antenna elements per sector
   antenna_window: rectangular
+  downtilt_sweep_deg: [2, 4, 6, 8, 10, 12]
+
+channel:
+  carrier_frequency: 3.5e+9     # Hz, n78 FR1 mid-band
   bs_tx_power_dbm: 40.0
   channel_bandwidth_prb: 50
   temperature: 294.0            # K
-  downtilt_sweep_deg: [2, 4, 6, 8, 10, 12]
+
+kpi:
   coverage_threshold_db: 0.0
-  coordinate_ascent_max_rounds: 20
+  sinr_percentiles: [50, 5]
+
+mobility:
   mobility_model: rpgm
   min_ut_speed: 1.0             # m/s
   max_ut_speed: 2.0             # m/s
   num_groups: 60
   deviation_radius_frac_area: 0.05
   member_jitter_speed: 1.0      # m/s
-  max_realization_cuda: 1
+
+simulation:
   measurement_interval_s: 1.0
-  num_slots: 500
-  num_realizations_per_slot: 1
-  # Deterministic seed for the ENVIRONMENT only (topology/mobility/UE-drop
-  # randomness, plus Sionna's own pathloss/shadow-fading sampling) -- every
-  # algorithm sees the exact same environment trajectory regardless of its
-  # own seed. Any algorithm-side randomness (e.g. a future DQN's network
-  # init/exploration) must use its own separate seed, not this one -- see
-  # test_dynamic_scenario_tilts_effect.py's environment_generator.
-  environment_seed: 1
-
-test_dynamic_scenario_tilts_effect:
-  sinr_percentiles: [50, 5, 1]
-  adaptive_legacy_overlap_margin_db: 3.0
-  adaptive_legacy_edge_percentile: 95.0
-  adaptive_legacy_tilt_step_deg: 2.0
-  # Empirically calibrated against this topology (see AdaptiveLegacyTiltController's
-  # own __init__ docstring for the measured n_os/r_bc ranges these were
-  # picked from) -- NOT a general prior; a guessed 0.05/0.20 made the
-  # overshoot branch permanently unreachable (measured max ~0.01 across the
-  # whole tilt range), turning the controller into a one-way ratchet.
-  adaptive_legacy_os_threshold: 0.006
-  adaptive_legacy_bc_threshold: 0.33
-  # Two-timescale structure: measurement_interval_s (common, 1.0 s) draws a
-  # fresh channel every second; a tilt decision only happens once every
-  # tilt_control_interval_s, pooling every measurement draw in between --
-  # confirmed sufficient (and mobility-robust) by test_tilt_window_calibration.py.
   tilt_control_interval_s: 300.0
-  num_tilt_control_intervals: 500
-  # DRL (Independent DQN) tilt controller -- a fifth method, decided and
-  # scored inline in the SAME per-interval loop as everyone else (riding on
-  # the same cached channel state -- no separate environment/run). "Episode"
-  # == one tilt control interval, i.e. this whole 500-interval run is ONE
-  # continuous online training pass, not repeated environment resets -- see
-  # the design discussion this was built from.
-  policy_name: independent-dqn     # or "random", for a pipeline sanity check
-  # ALGORITHM-only seed (network weight init, epsilon-greedy exploration,
-  # replay sampling) -- fully separate from common.environment_seed, never
-  # touches the environment's own RNG stream and vice versa (see
-  # drl/independent_dqn.py and helpers/tilt_environment.py).
-  algorithm_seed: 1
-  # state_type/reward_type select a named branch in drl/interface.py's
-  # compute_state()/compute_reward() -- swapping formulations is a config
-  # change, not a code edit. Only one of each is implemented so far
-  # (coverage_overshoot / hard); more (e.g. a tilt-including state, a
-  # continuous-SINR-margin "soft" reward) are a planned follow-up.
-  state_type: coverage_overshoot
-  reward_type: hard
-  # Per-sector reward = reward_lambda_coverage * coverage
-  #                   - reward_lambda_overshoot * overshoot
-  # (the same two numbers used as state); the two are meant to sum to 1.
-  # Overshoot reuses adaptive_legacy_overlap_margin_db above -- same
-  # definition (see helpers.tilt_environment.compute_per_sector_coverage_overshoot).
-  reward_lambda_coverage: 0.9
-  reward_lambda_overshoot: 0.1
-  dqn:
-    hidden_sizes: [32]
-    learning_rate: 5.0e-4
-    gamma: 0.95
-    batch_size: 32
-    replay_capacity: 10000
-    warmup_steps: 32
-    target_update_steps: 30
-    epsilon_start: 1.0
-    epsilon_end: 0.01
-    epsilon_decay_rate: 0.985
-  # Last N intervals averaged for the steady-state comparison -- applied
-  # uniformly to EVERY method (not just DRL), for a fair "converged policy"
-  # comparison (the classical methods are roughly stationary from interval
-  # 0, so this mostly matters for DRL, but it's computed the same way for
-  # all five so the comparison is apples-to-apples).
+  num_tilt_control_intervals: 350
   steady_state_episodes: 50
+  num_realizations_per_slot: 1
+  environment_seed: 1
+  max_realization_cuda: 1
 
-test_static_scenario_tilts_effect:
-  total_realizations: 500
+algorithms:
+  optimization:
+    coordinate_ascent_max_rounds: 20
 
+  adaptive_legacy:
+    overlap_margin_db: 3.0
+    edge_percentile: 95.0
+    tilt_step_deg: 2.0
+    os_threshold: 0.006
+    bc_threshold: 0.33
+  
+  drl:
+    policy_name: independent-dqn     # or "random"
+    algorithm_seed: 1
+    state_type: coverage_overshoot
+    reward_type: hard
+    reward_lambda_coverage: 0.9
+    reward_lambda_overshoot: 0.1
+
+    dqn:
+      hidden_sizes: [32]
+      learning_rate: 5.0e-4
+      gamma: 0.95
+      batch_size: 32
+      replay_capacity: 10000
+      warmup_steps: 32
+      target_update_steps: 30
+      epsilon_start: 1.0
+      epsilon_end: 0.01
+      epsilon_decay_rate: 0.985
+  
 test_tilt_window_calibration:
   candidate_window_slots: [1, 10]
   num_windows_per_candidate: 300
@@ -116,14 +83,4 @@ test_tilt_window_calibration:
       max_ut_speed: 30.0
     - name: highway
       min_ut_speed: 50.0
-      max_ut_speed: 80.0
-
-verify_mobility:
-  num_slots: 120                # quick visual check, not a full study
-
-verify_radio_map:
-  grid_spacing_m: 20.0
-  num_realizations: 20
-  grid_chunk_size: 150
-  num_live_ut: 200
-  live_check_tilt_deg: 8.0
+      max_ut_speed: 80.0     
