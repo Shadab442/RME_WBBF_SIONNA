@@ -1,53 +1,51 @@
 """Environment-side RL interface: state/reward construction and action
 interpretation -- the contract between the environment
 (helpers/simulation_engine.py) and any policy (drl/factory.py).
-
-Named/typed so a new state or reward formulation is a new branch here plus
-a config value (state_type / reward_type), not an edit to whatever script
-is running the comparison. Mirrors drl/factory.py's create_policy(name, ...)
-pattern for the same reason.
-
-Distinct from helpers.kpi_manager.KpiManager.compute_ue_kpis: that computes
-raw per-sector KPIs (coverage fraction, overshoot fraction) -- general-
-purpose measurements shared by DRL and AdaptiveLegacyTiltController alike.
-This module turns those raw KPIs into an RL-specific state vector and
-scalar reward, which is what's actually DRL-specific -- not the KPIs
-themselves.
 """
 
 import numpy as np
 
+_TOP_K_STATE_TYPES = ("top_k_neighbor", "predicted_top_k_neighbor")
 
-def compute_state(state_type, coverage_per_sector, overshoot_per_sector, tilt_deg_per_sector=None):
+
+def compute_state(state_type, own_tilt_norm, neighbor_overshoot, top_k_identity, top_k_coverage):
     """
-    :param state_type: "coverage_overshoot" -- the only type implemented so
-        far: [coverage, overshoot] per sector.
-    :param tilt_deg_per_sector: unused by "coverage_overshoot"; kept as a
-        parameter so a future tilt-including state_type doesn't change this
-        function's call signature, just adds a branch.
+    :param state_type:
+        "top_k_neighbor" / "predicted_top_k_neighbor" 
+    :param own_tilt_norm: [num_sectors] float in [0,1].
+    :param neighbor_overshoot: [num_sectors, max_neighbors].
+    :param top_k_identity, top_k_coverage: [num_sectors, top_k_locations]
+        each -- top_k_identity is each selected grid cell's own index
+        (normalized to [0,1]), always a real value (ranking a fixed-size
+        grid always produces a definite top-k); top_k_coverage is that
+        cell's coverage fraction, -1 if it had zero visits this window.
     :output: [num_sectors, num_features] numpy array.
     """
-    if state_type == "coverage_overshoot":
-        return np.stack([coverage_per_sector, overshoot_per_sector], axis=1)
+    if state_type in _TOP_K_STATE_TYPES:
+        num_sectors = own_tilt_norm.shape[0]
+        # [identity, coverage] interleaved per selected location.
+        top_k_flat = np.stack([top_k_identity, top_k_coverage], axis=-1).reshape(num_sectors, -1)
+        return np.concatenate([own_tilt_norm[:, None], top_k_flat, neighbor_overshoot], axis=1)
     raise ValueError(f"Unknown state_type: {state_type!r}")
 
 
-def num_features_for(state_type):
+def num_features_for(state_type, max_neighbors, top_k_locations):
     """Feature count for a given state_type, so callers (e.g. sizing a
-    policy's input layer) don't have to duplicate compute_state's branching."""
-    if state_type == "coverage_overshoot":
-        return 2
+    policy's input layer) don't have to duplicate compute_state's branching.
+    """
+    if state_type in _TOP_K_STATE_TYPES:
+        return 1 + 2 * top_k_locations + max_neighbors
     raise ValueError(f"Unknown state_type: {state_type!r}")
 
 
 def compute_reward(reward_type, coverage_per_sector, overshoot_per_sector,
                    reward_lambda_coverage, reward_lambda_overshoot):
     """
-    :param reward_type: "hard" -- the only type implemented so far:
-        reward_lambda_coverage * coverage_per_sector -
-        reward_lambda_overshoot * overshoot_per_sector, both plain
-        threshold-crossing fractions. ("soft", a continuous SINR-margin
-        version, is a planned addition -- not yet implemented.)
+    :param reward_type:
+        "hard" -- per-sector reward_lambda_coverage * coverage_per_sector[i]
+            - reward_lambda_overshoot * overshoot_per_sector[i], both plain
+            threshold-crossing fractions. ("soft", a continuous SINR-margin
+            version, is a planned addition -- not yet implemented.)
     :output: [num_sectors] numpy array.
     """
     if reward_type == "hard":

@@ -218,8 +218,11 @@ plt.close(fig)
 print(f"Saved: {path}")
 
 # ------------------------ DRL reward/loss vs episode ------------------------
-mean_drl_reward = DRL_REWARD_HISTORY.mean(axis=1)
-mean_drl_overshoot = DRL_OVERSHOOT_HISTORY.mean(axis=1)
+# nanmean, not mean: a sector with no served UEs that interval is NaN (see
+# KpiManager.compute_ue_kpis) -- one masked-out sector shouldn't blank out
+# the whole interval's plotted point.
+mean_drl_reward = np.nanmean(DRL_REWARD_HISTORY, axis=1)
+mean_drl_overshoot = np.nanmean(DRL_OVERSHOOT_HISTORY, axis=1)
 episode = np.arange(NUM_TILT_CONTROL_INTERVALS)
 
 fig, (ax_reward, ax_loss) = plt.subplots(2, 1, figsize=(9, 8), sharex=True)

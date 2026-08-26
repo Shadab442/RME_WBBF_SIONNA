@@ -34,7 +34,7 @@ from helpers.utils import load_config, save_mobility_animation
 from helpers.simulation_engine import SimulationEngine
 
 sionna.phy.config.precision = "single"
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cuda:0"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 sionna.phy.config.device = DEVICE
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "results", "main")

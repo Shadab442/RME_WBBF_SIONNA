@@ -1,9 +1,7 @@
 """Multi-agent tilt-control policy interface.
 
 Every sector always has the same fixed action set (one entry per candidate
-in DOWNTILT_SWEEP_DEG) -- unlike variable-candidate problems (e.g. handover
-among a changing set of visible cells), no action masking is needed
-anywhere in this interface or in any implementation of it.
+in DOWNTILT_SWEEP_DEG)
 """
 
 from abc import ABC, abstractmethod
@@ -22,15 +20,22 @@ class TiltPolicy(ABC):
         self.step_losses = []
 
     @abstractmethod
-    def act(self, observations, training):
+    def act(self, observations, training, mask=None, default_action=None):
         """:param observations: [num_sectors, num_features].
         :param training: if True, exploration (e.g. epsilon-greedy) is
             active; if False, act greedily.
+        :param mask: [num_sectors] bool, optional -- False skips
+            exploring/predicting for that sector, using default_action
+            instead.
+        :param default_action: [num_sectors] int, optional -- action used
+            for a sector where mask is False (e.g. 0 for "no data", or that
+            sector's own held-over tilt index for "not its turn"). Zeros if
+            omitted.
         :output: [num_sectors] int array of chosen action (tilt) indices.
         """
 
     @abstractmethod
-    def observe(self, observations, actions, rewards, next_observations, terminal):
+    def observe(self, observations, actions, rewards, next_observations, terminal, mask=None):
         """One completed transition per sector: observations/actions is
         what was seen/chosen on entry to the interval that produced
         rewards/next_observations. May trigger learning.
@@ -40,6 +45,10 @@ class TiltPolicy(ABC):
         :param rewards: [num_sectors] float.
         :param terminal: bool, True only for a transition with no valid
             next state to bootstrap from.
+        :param mask: [num_sectors] bool, optional -- False means this
+            sector's transition isn't real (either the state it started
+            from or the outcome it produced was undefined) and should be
+            discarded rather than learned from.
         """
 
     def end_episode(self):

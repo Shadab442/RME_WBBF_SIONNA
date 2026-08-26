@@ -125,7 +125,8 @@ class AdaptiveLegacyTiltController(TiltController):
         """The starting tilt"""
         return self.tilt_deg
 
-    def update(self, overshoot_per_sector: np.ndarray, per_sector_coverage: np.ndarray) -> np.ndarray:
+    def update(self, overshoot_per_sector: np.ndarray, per_sector_coverage: np.ndarray,
+              has_data: np.ndarray = None) -> np.ndarray:
         """Advance ``self.tilt_deg`` by one interval and return it -- pure
         decision logic; the measurement (n_os/r_bc's ingredients) is
         KpiManager.compute_ue_kpis's job (overshoot + edge-restricted
@@ -136,9 +137,12 @@ class AdaptiveLegacyTiltController(TiltController):
         :param per_sector_coverage: [num_sectors] edge-restricted GOOD-coverage
             fraction, from compute_ue_kpis(..., edge_percentile=...) -- r_bc
             (bad-coverage fraction) is 1 minus this.
+        :param has_data: [num_sectors] bool, optional -- False marks a sector
+            with no real observation this interval (e.g. zero served UEs). 
+            That sector's tilt is reset to 0 deg
         """
-        n_os = overshoot_per_sector
-        r_bc = 1.0 - per_sector_coverage
+        n_os = np.nan_to_num(overshoot_per_sector, nan=0.0)
+        r_bc = 1.0 - np.nan_to_num(per_sector_coverage, nan=0.0)
 
         # Status check
         interference_problem = n_os > self.os_threshold
@@ -154,6 +158,9 @@ class AdaptiveLegacyTiltController(TiltController):
         delta_tilt = increase_downtilt * self.tilt_step_deg + decrease_downtilt * (-self.tilt_step_deg)
         self.tilt_deg = np.clip(self.tilt_deg + delta_tilt, self.theta_min_deg, self.theta_max_deg)
 
+        if has_data is not None:
+            self.tilt_deg = np.where(has_data, self.tilt_deg, 0.0)
+
         return self.tilt_deg
 
 
@@ -163,12 +170,10 @@ class GlobalTiltSelector:
     the power table.
     """
 
-    def select(self, kpi_manager, power_table: np.ndarray, threshold_db: float, warm_start=None,
-              weights: np.ndarray = None) -> np.ndarray:
+    def select(self, kpi_manager, power_table: np.ndarray, threshold_db: float, warm_start=None) -> np.ndarray:
         num_tilts, num_sectors = power_table.shape[0], power_table.shape[2]
         coverages = np.array([
-            kpi_manager.compute_ue_kpis(power_table, np.full(num_sectors, t, dtype=int), threshold_db,
-                                     weights=weights)["coverage"]
+            kpi_manager.compute_ue_kpis(power_table, np.full(num_sectors, t, dtype=int), threshold_db)["coverage"]
             for t in range(num_tilts)
         ])
 
@@ -193,14 +198,13 @@ class LocalTiltSelector:
         self.last_num_rounds = None
         self.last_coverage_trace = None
 
-    def select(self, kpi_manager, power_table: np.ndarray, threshold_db: float, warm_start=None,
-              weights: np.ndarray = None) -> np.ndarray:
+    def select(self, kpi_manager, power_table: np.ndarray, threshold_db: float, warm_start=None) -> np.ndarray:
         num_tilts, num_sectors = power_table.shape[0], power_table.shape[2]
         if warm_start is None:
-            warm_start = GlobalTiltSelector().select(kpi_manager, power_table, threshold_db, weights=weights)
+            warm_start = GlobalTiltSelector().select(kpi_manager, power_table, threshold_db)
         assignment = np.array(warm_start, dtype=int).copy()
 
-        coverage_trace = [kpi_manager.compute_ue_kpis(power_table, assignment, threshold_db, weights=weights)["coverage"]]
+        coverage_trace = [kpi_manager.compute_ue_kpis(power_table, assignment, threshold_db)["coverage"]]
 
         # Coverage ascent algorithm
         num_rounds_run = 0
@@ -212,14 +216,13 @@ class LocalTiltSelector:
                 for t in range(num_tilts):
                     trial = assignment.copy()
                     trial[s] = t
-                    trial_coverages[t] = kpi_manager.compute_ue_kpis(power_table, trial, threshold_db,
-                                                                     weights=weights)["coverage"]
+                    trial_coverages[t] = kpi_manager.compute_ue_kpis(power_table, trial, threshold_db)["coverage"]
                 best_t = int(np.argmax(trial_coverages))
                 if best_t != assignment[s]:
                     assignment[s] = best_t
                     changed = True
             coverage_trace.append(
-                kpi_manager.compute_ue_kpis(power_table, assignment, threshold_db, weights=weights)["coverage"])
+                kpi_manager.compute_ue_kpis(power_table, assignment, threshold_db)["coverage"])
             if not changed:
                 break
 
@@ -243,12 +246,11 @@ class SearchTiltController(TiltController):
         self.selector = selector
         self.assignment = None
 
-    def initial_select(self, kpi_manager, power_table: np.ndarray, threshold_db: float,
-                       weights: np.ndarray = None) -> np.ndarray:
-        self.assignment = self.selector.select(kpi_manager, power_table, threshold_db, weights=weights)
+    def initial_select(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
+        self.assignment = self.selector.select(kpi_manager, power_table, threshold_db)
         return self.assignment
 
-    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float, weights: np.ndarray = None) -> np.ndarray:
+    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
         raise NotImplementedError
 
 
@@ -258,9 +260,9 @@ class StaticTiltController(SearchTiltController):
     calibration (like a drive test).
     """
 
-    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float, weights: np.ndarray = None) -> np.ndarray:
+    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
         if self.assignment is None:
-            return self.initial_select(kpi_manager, power_table, threshold_db, weights=weights)
+            return self.initial_select(kpi_manager, power_table, threshold_db)
         return self.assignment
 
 
@@ -269,20 +271,15 @@ class DynamicTiltController(SearchTiltController):
     previous assignment -- e.g. Dynamic Global / Dynamic Local.
     """
 
-    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float, weights: np.ndarray = None) -> np.ndarray:
+    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
         if self.assignment is None:
-            return self.initial_select(kpi_manager, power_table, threshold_db, weights=weights)
-        self.assignment = self.selector.select(kpi_manager, power_table, threshold_db, warm_start=self.assignment,
-                                               weights=weights)
+            return self.initial_select(kpi_manager, power_table, threshold_db)
+        self.assignment = self.selector.select(kpi_manager, power_table, threshold_db, warm_start=self.assignment)
         return self.assignment
 
 
 class RLTiltController(TiltController):
     """Connects the simulation to a generic DRL tilt policy.
-    At each interval, the policy observes the current network state,
-    receives the reward from the previously applied action, and
-    selects the action for the next interval using one-interval-lag causal control.
-    Each RL transition is stored as (state,action,reward,next state).
 
     :ivar tilt_idx: [num_sectors] current tilt INDEX -- the action currently in effect.
     """
@@ -291,28 +288,60 @@ class RLTiltController(TiltController):
         self.policy = policy
         self.tilt_idx = np.full(num_sectors, initial_tilt_idx, dtype=np.int64)
         self._prev_observations = None
-        self._prev_actions = None
+        self._prev_actions = np.zeros(num_sectors, dtype=np.int64)
+        self._prev_valid = np.zeros(num_sectors, dtype=bool)
 
     def initial_select(self) -> np.ndarray:
         """The starting tilt INDEX"""
         return self.tilt_idx
 
     def update(self, observations: np.ndarray, rewards: np.ndarray, training: bool,
+              has_data: np.ndarray = None, schedule: np.ndarray = None,
               terminal: bool = False) -> np.ndarray:
         """
-        :param observations: [num_sectors, num_features], resulting from
-            ``self.tilt_idx`` (the action decided on the PREVIOUS call).
-        :param rewards: [num_sectors], likewise resulting from that action.
-        :param training: if True, learn from the completed transition (if
-            any) and explore; if False, act greedily and don't learn.
-        :output: the NEW ``self.tilt_idx``, decided from ``observations``,
-            to apply for the next interval.
+        :param observations: [num_sectors, num_features] -- only rows for
+            scheduled sectors need be meaningful this call.
+        :param rewards: [num_sectors], only meaningful for scheduled
+            sectors -- reward from each scheduled sector's own previously
+            stored action.
+        :param training: if True, learn from each scheduled sector's
+            completed transition and explore; if False, act greedily and
+            don't learn.
+        :param has_data: [num_sectors] bool, optional -- False marks a
+            sector with no real observation this call. A transition is
+            added to experience only if both the state it started from
+            (this sector's own last-stored validity) and the outcome it
+            produced (this call's has_data) had real data.
+        :param schedule: [num_sectors] bool, optional -- False means this
+            sector's window hasn't closed yet this call; it holds
+            ``self.tilt_idx`` unchanged and its stored previous-state is
+            left untouched. A scheduled sector with no data (has_data
+            False) falls back to index 0 (0 deg).
         """
-        if training and self._prev_observations is not None:
-            self.policy.observe(self._prev_observations, self._prev_actions, rewards,
-                               observations, terminal)
-        actions = self.policy.act(observations, training)
-        self._prev_observations = observations
-        self._prev_actions = actions
-        self.tilt_idx = actions
+        num_sectors = len(observations)
+        if has_data is None:
+            has_data = np.ones(num_sectors, dtype=bool)
+        if schedule is None:
+            schedule = np.ones(num_sectors, dtype=bool)
+
+        if training and self._prev_observations is not None and schedule.any():
+            transition_valid = schedule & self._prev_valid & has_data
+            if transition_valid.any():
+                self.policy.observe(self._prev_observations, self._prev_actions, rewards,
+                                   observations, terminal, mask=transition_valid)
+
+        # Only a scheduled sector with real data gets to pick a new tilt;
+        act_mask = schedule & has_data
+        actions = self.policy.act(observations, training, mask=act_mask, default_action=self.tilt_idx)
+
+        # a scheduled-but-dataless one falls back to index 0.
+        if self._prev_observations is None:
+            self._prev_observations = np.zeros_like(observations)
+
+        # Only scheduled sectors' stored state advances this call
+        self._prev_observations[schedule] = observations[schedule]
+        self._prev_actions[schedule] = actions[schedule]
+        self._prev_valid[schedule] = has_data[schedule]
+        self.tilt_idx[schedule] = actions[schedule]
+        
         return self.tilt_idx

@@ -21,13 +21,17 @@ class RandomPolicy(TiltPolicy):
         self.num_actions = num_actions
         self.rng = random.Random(algorithm_seed)
 
-    def act(self, observations, training):
-        return np.array(
+    def act(self, observations, training, mask=None, default_action=None):
+        actions = np.array(
             [self.rng.randrange(self.num_actions) for _ in range(self.num_sectors)],
             dtype=np.int64,
         )
+        if mask is not None:
+            defaults = np.zeros(self.num_sectors, dtype=np.int64) if default_action is None else default_action
+            actions = np.where(mask, actions, defaults)
+        return actions
 
-    def observe(self, observations, actions, rewards, next_observations, terminal):
+    def observe(self, observations, actions, rewards, next_observations, terminal, mask=None):
         pass
 
     def save(self, path):

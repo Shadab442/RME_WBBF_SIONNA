@@ -5,7 +5,7 @@ import math
 
 import torch
 
-from .ue_drop import sample_disk_offset, sample_valid_offset
+from .ue_drop import UeDropper
 
 
 class MobilityModel:
@@ -20,6 +20,15 @@ class MobilityModel:
 
     def step(self, dt: float) -> torch.Tensor:
         """Advance positions by dt [s]; updates and returns self.ut_loc."""
+        raise NotImplementedError
+
+    def clone(self, generator=None) -> "MobilityModel":
+        """Independent copy of this model's current tensors to be used for 
+        oracle.
+
+        :param generator: replaces the clone's own generator if given, so
+            its random draws land on a separate stream from the real run's.
+        """
         raise NotImplementedError
 
 
@@ -48,7 +57,7 @@ class ReferencePointGroupMobility(MobilityModel):
     ):
         """
         :param ut_loc: [num_ut, 3] initial member positions -- e.g. from
-            ``helpers.ue_drop.sample_clustered_ut_loc``. This class only
+            ``helpers.ue_drop.UeDropper.clustered``. This class only
             evolves these positions; it doesn't generate them.
         :param member_group_idx: [num_ut] which group (an index into
             ``start_xy_list``) each member belongs to -- from the same drop
@@ -65,13 +74,16 @@ class ReferencePointGroupMobility(MobilityModel):
         :param member_jitter_speed: how fast each member's own offset from
             its group's reference point drifts per step [m/s].
         """
+        # Initialization
         self.dtype, self.device, self.generator = ut_loc.dtype, ut_loc.device, generator
         self.deviation_radius = deviation_radius
         self.topo = topo
+        self._sampler = UeDropper(topo, self.dtype, self.device, generator)
         self.min_speed, self.max_speed = min_speed, max_speed
         self.member_jitter_speed = member_jitter_speed
         self.member_group_idx = member_group_idx
 
+        # Reference points
         self.ref_xy = torch.tensor(start_xy_list, dtype=self.dtype, device=self.device)  # [num_groups, 2]
         num_groups = self.ref_xy.shape[0]
 
@@ -81,6 +93,7 @@ class ReferencePointGroupMobility(MobilityModel):
         for i in range(num_groups):
             self._pick_new_waypoint(i)
 
+        # Per-member state
         self._z = ut_loc[:, 2:3].clone()  # persistent per-member height, carried as-is
         ref_per_member = self.ref_xy[self.member_group_idx]
         self.member_offset = ut_loc[:, :2] - ref_per_member  # each member's offset, as given
@@ -100,8 +113,7 @@ class ReferencePointGroupMobility(MobilityModel):
         """Draws a new random destination (within the topology's actual
         coverage footprint) and speed for a group's reference point."""
         origin = torch.zeros(1, 2, dtype=self.dtype, device=self.device)
-        dest = sample_valid_offset(origin, self.topo.default_drop_radius, self.topo,
-                                   self.dtype, self.device, self.generator)
+        dest = self._sampler.valid_points(origin, self.topo.default_drop_radius)
         self.dest_xy[group_idx] = dest[0]
         u = torch.rand((), dtype=self.dtype, device=self.device, generator=self.generator)
         self.speed[group_idx] = self.min_speed + (self.max_speed - self.min_speed) * u
@@ -126,12 +138,13 @@ class ReferencePointGroupMobility(MobilityModel):
         # Members drift by a small random step from their PREVIOUS offset
         ref_per_member = self.ref_xy[self.member_group_idx]
         num_ut = ref_per_member.shape[0]
-        jitter = sample_disk_offset(self.member_jitter_speed * dt, num_ut, self.dtype, self.device, self.generator)
+        jitter = self._sampler.disk_offset(self.member_jitter_speed * dt, num_ut)
         new_offset = self.member_offset + jitter
         mag = torch.linalg.norm(new_offset, dim=-1)
         too_far = mag > self.deviation_radius
         new_offset[too_far] = new_offset[too_far] / mag[too_far, None] * self.deviation_radius
 
+        # Validate proposed positions
         xy = ref_per_member + new_offset
         ok = self._is_valid(xy)
 
@@ -145,9 +158,8 @@ class ReferencePointGroupMobility(MobilityModel):
         # Resample persistently invalid members around the current group reference to prevent edge freezing
         still_bad = (~ok) & (~fallback_ok)
         if still_bad.any():
-            resampled_xy = sample_valid_offset(
-                ref_per_member[still_bad], self.deviation_radius, self.topo,
-                self.dtype, self.device, self.generator,
+            resampled_xy = self._sampler.valid_points(
+                ref_per_member[still_bad], self.deviation_radius,
                 min_dist_from_site=self.topo.min_bs_ut_dist,
             )
             xy[still_bad] = resampled_xy
@@ -156,6 +168,25 @@ class ReferencePointGroupMobility(MobilityModel):
         self.member_offset = new_offset
         self.ut_loc = torch.cat([xy, self._z], dim=-1)
         return self.ut_loc
+
+    def clone(self, generator=None) -> "ReferencePointGroupMobility":
+        # Copy state
+        new = object.__new__(ReferencePointGroupMobility)
+        new.dtype, new.device = self.dtype, self.device
+        new.generator = generator if generator is not None else self.generator
+        new.deviation_radius = self.deviation_radius
+        new.topo = self.topo
+        new._sampler = UeDropper(new.topo, new.dtype, new.device, new.generator)
+        new.min_speed, new.max_speed = self.min_speed, self.max_speed
+        new.member_jitter_speed = self.member_jitter_speed
+        new.member_group_idx = self.member_group_idx
+        new.ref_xy = self.ref_xy.clone()
+        new.dest_xy = self.dest_xy.clone()
+        new.speed = self.speed.clone()
+        new._z = self._z.clone()
+        new.member_offset = self.member_offset.clone()
+        new.ut_loc = self.ut_loc.clone()
+        return new
 
 
 class RandomWalkMobility(MobilityModel):
@@ -175,6 +206,8 @@ class RandomWalkMobility(MobilityModel):
         self.topo = topo
         dtype, device = ut_loc.dtype, ut_loc.device
         num_ut = ut_loc.shape[0]
+
+        # Per-UE speed and heading, fixed for the model's whole lifetime
         speed = min_speed + (max_speed - min_speed) * torch.rand(
             num_ut, dtype=dtype, device=device, generator=generator
         )
@@ -193,3 +226,11 @@ class RandomWalkMobility(MobilityModel):
             xy[still_outside] = self.ut_loc[still_outside, :2]
         self.ut_loc = torch.cat([xy, self.ut_loc[:, 2:3]], dim=-1)
         return self.ut_loc
+
+    def clone(self, generator=None) -> "RandomWalkMobility":
+        # Copy state
+        new = object.__new__(RandomWalkMobility)
+        new.topo = self.topo
+        new.ut_loc = self.ut_loc.clone()
+        new.velocity_xy = self.velocity_xy.clone()
+        return new

@@ -1,6 +1,7 @@
 # Hex-grid BS site/sector layout (a thing wrapper around sionna.sys.topology.HexGrid),
 import math
 
+import numpy as np
 import torch
 
 from sionna.phy import PI
@@ -19,6 +20,13 @@ class CellularTopology:
     :ivar site_loc: [num_cells, 2]. BS site (x, y) positions [m].
     :ivar num_cells: number of BS sites.
     :ivar num_bs: total sectors (``num_cells * num_sectors_per_site``).
+    :ivar isd: inter-site distance [m].
+    :ivar sector_adjacency: [num_bs, num_bs] bool, symmetric -- see
+        _compute_sector_adjacency.
+    :ivar neighbor_ids: [num_bs, max_neighbors] int, -1-padded fixed
+        per-sector neighbor ordering, for per-neighbor (not pooled)
+        breakdowns.
+    :ivar max_neighbors: widest neighbor count across all sectors.
     """
 
     def __init__(
@@ -84,6 +92,66 @@ class CellularTopology:
         self.site_loc = bs_loc[0, ::num_sectors_per_site, :2]  # [num_cells, 2]
         self.num_cells = num_cells
         self.num_bs = num_bs
+        self.isd = float(isd.item())
+
+        # Sector adjacency -- needed by KpiManager for overshoot/per-neighbor
+        # KPIs, computed here since it's pure site/sector geometry.
+        bs_xy = self.bs_loc[0, :, :2].detach().cpu().numpy()
+        boresight_rad = self.bs_orientations[0, :, 0].detach().cpu().numpy()
+        self.sector_adjacency = self._compute_sector_adjacency(bs_xy, boresight_rad, self.isd)
+        neighbor_lists = [np.where(row)[0] for row in self.sector_adjacency]
+        self.max_neighbors = max((len(nl) for nl in neighbor_lists), default=0)
+        self.neighbor_ids = np.full((num_bs, self.max_neighbors), -1, dtype=int)
+        for i, nl in enumerate(neighbor_lists):
+            self.neighbor_ids[i, :len(nl)] = nl
+
+    @staticmethod
+    def _compute_sector_adjacency(bs_xy: np.ndarray, boresight_rad: np.ndarray, isd: float) -> np.ndarray:
+        """[num_sectors, num_sectors] bool, symmetric, diagonal False --
+        sector j is a neighbor of sector i if they're co-located (same
+        site), or if sector i's own rhombus territory shares an outer edge
+        with sector j's. A regular hexagon splits into 3 congruent rhombi
+        when cut from its center to alternating vertices, one per sector
+        -- each rhombus has 4 edges: 2 RADIAL edges shared with its 2
+        same-site siblings (handled by the same-site case), and 2 OUTER
+        (hex-perimeter) edges, each shared with exactly ONE specific
+        sector at a neighboring site -- the outward direction through
+        each outer edge's midpoint is boresight +-30 deg, at distance ISD.
+        Which of that neighboring site's 3 sectors actually owns the
+        shared edge is found by the SAME test run in reverse (does that
+        candidate sector's own outer-edge direction point back at this
+        site).
+
+        This definition supersedes an earlier, coarser site-distance-only
+        version (any sector at a nearest-neighbor SITE counted as a
+        neighbor, regardless of orientation) -- that overcounted badly
+        (e.g. 20 neighbors for a sector whose own beam only ever faces 2
+        of its site's up-to-6 nearest sites) and is used consistently
+        everywhere adjacency matters (overshoot, per-neighbor state),
+        not just for sizing a state vector.
+        """
+        def wrap(a):
+            return (a + np.pi) % (2 * np.pi) - np.pi
+
+        num_sectors = bs_xy.shape[0]
+        site_dist = np.linalg.norm(bs_xy[:, None, :] - bs_xy[None, :, :], axis=-1)
+        same_site = site_dist < 1e-6
+
+        adjacency = same_site.copy()
+        for i in range(num_sectors):
+            for edge_dir in (boresight_rad[i] - np.pi / 6, boresight_rad[i] + np.pi / 6):
+                target = bs_xy[i] + isd * np.array([np.cos(edge_dir), np.sin(edge_dir)])
+                candidates = np.where((np.linalg.norm(bs_xy - target[None, :], axis=1) < isd * 0.05)
+                                      & ~same_site[i])[0]
+                if candidates.size == 0:
+                    continue
+                reverse_dir = wrap(edge_dir + np.pi)
+                for j in candidates:
+                    for j_edge_dir in (boresight_rad[j] - np.pi / 6, boresight_rad[j] + np.pi / 6):
+                        if abs(wrap(j_edge_dir - reverse_dir)) < np.radians(5):
+                            adjacency[i, j] = True
+        np.fill_diagonal(adjacency, False)
+        return adjacency
 
     @property
     def default_drop_radius(self) -> float:
@@ -138,3 +206,96 @@ class CellularTopology:
         # Co-located sectors at a site share the same virtual site position.
         virtual_loc = virtual_loc.repeat_interleave(self.num_sectors_per_site, dim=2)
         return virtual_loc.permute(0, 2, 1, 3)  # [batch, num_bs, num_ut, 3]
+
+    def build_sector_rhombus_grid(self, cell_size: float) -> tuple:
+        """Per-sector rhombus spatial sub-grid for the spatial-coverage DRL
+        state -- NOT self.grid (the coarser per-site hex layout used for
+        rendering). A regular hexagon splits into 3 congruent rhombi when
+        cut from center to alternating vertices, one per sector; grid
+        cells are laid out in the rhombus's own oblique basis (mirror
+        images of each other about boresight, so plain row-major
+        (alpha, beta) indexing is automatically boresight-mirror-
+        symmetric). See memory project_drl_state_taxonomy_v2 for the full
+        design rationale. Caches the basis vectors internally for
+        assign_to_sector_rhombus_grid.
+
+        :param cell_size: target grid cell size [m] -- divisions per side
+            is ceil(hex circumradius / cell_size).
+        :output: (grid_points [num_bs, n*n, 2], n) -- grid_points are
+            world-coordinate cell centers, row-major over (alpha, beta);
+            n is divisions per side (n*n points per sector).
+        """
+        bs_xy = self.bs_loc[0, :, :2].detach().cpu().numpy()
+        boresight_rad = self.bs_orientations[0, :, 0].detach().cpu().numpy()
+        side_length = float(self.grid.cell_radius.item())
+
+        # Grid resolution
+        n = int(np.ceil(side_length / cell_size))
+
+        # Two rhombus oblique basis vectors in +-60deg directions
+        e1 = side_length * np.stack(
+            [np.cos(boresight_rad - np.pi / 3), np.sin(boresight_rad - np.pi / 3)], axis=-1)
+        e2 = side_length * np.stack(
+            [np.cos(boresight_rad + np.pi / 3), np.sin(boresight_rad + np.pi / 3)], axis=-1)
+
+        # Grid center coordinates
+        frac = (np.arange(n) + 0.5) / n
+        alpha, beta = np.meshgrid(frac, frac, indexing="ij")
+        alpha, beta = alpha.reshape(-1), beta.reshape(-1)  # [n*n], row-major (a, b)
+        grid_points = (bs_xy[:, None, :] + alpha[None, :, None] * e1[:, None, :]
+                      + beta[None, :, None] * e2[:, None, :])  # [num_bs, n*n, 2]
+
+        self._sector_grid_bs_xy = bs_xy
+        self._sector_grid_e1 = e1
+        self._sector_grid_e2 = e2
+        self._sector_grid_n = n
+        return grid_points, n
+
+    def assign_to_sector_rhombus_grid(self, ut_xy: np.ndarray) -> tuple:
+        """For each UE position, find which sector's rhombus it
+        geographically falls in (if any) and which grid cell within that
+        sector -- keyed by GEOGRAPHY, not serving-sector assignment.
+        Requires build_sector_rhombus_grid to have been called first.
+
+        :param ut_xy: [num_ut, 2].
+        :output: (sector_idx, cell_idx) each [num_ut] int, -1 where a UE
+            falls outside every sector's rhombus (e.g. near the deployment
+            boundary, where no site's rhombus covers that point).
+        """
+        bs_xy, e1, e2, n = self._sector_grid_bs_xy, self._sector_grid_e1, self._sector_grid_e2, self._sector_grid_n
+
+        # Initialization
+        num_ut = ut_xy.shape[0]
+        num_sectors = bs_xy.shape[0]
+        sector_idx = np.full(num_ut, -1, dtype=int)
+        cell_idx = np.full(num_ut, -1, dtype=int)
+        unresolved = np.ones(num_ut, dtype=bool)
+
+        # Check in each sector
+        for s in range(num_sectors):
+            # Check for the unresolved UEs
+            if not unresolved.any():
+                break
+            idx_unresolved = np.where(unresolved)[0]
+
+            # Check if the UE is inside this sector
+            d = ut_xy[idx_unresolved] - bs_xy[s]
+            cross = e1[s, 0] * e2[s, 1] - e1[s, 1] * e2[s, 0]
+            alpha = (d[:, 0] * e2[s, 1] - d[:, 1] * e2[s, 0]) / cross
+            beta = (e1[s, 0] * d[:, 1] - e1[s, 1] * d[:, 0]) / cross
+
+            inside = (alpha >= 0) & (alpha < 1) & (beta >= 0) & (beta < 1)
+            matched = idx_unresolved[inside]
+
+            # Convert fractional coordinates into grid indices
+            a_idx = np.clip((alpha[inside] * n).astype(int), 0, n - 1)
+            b_idx = np.clip((beta[inside] * n).astype(int), 0, n - 1)
+
+            # Update matched sector and grid cell index
+            sector_idx[matched] = s
+            cell_idx[matched] = a_idx * n + b_idx
+
+            # Update unresolved UEs
+            unresolved[matched] = False
+
+        return sector_idx, cell_idx

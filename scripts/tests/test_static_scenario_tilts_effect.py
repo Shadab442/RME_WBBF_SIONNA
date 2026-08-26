@@ -3,7 +3,7 @@ differ from sector to sector, for a static (non-mobile) UE population?
 
 UEs are dropped in clusters (same generative model as
 test_dynamic_scenario_tilts_effect.py's RPGM population: NUM_GROUPS clusters
-split evenly across sites via helpers.ue_drop.sample_cluster_center_across_sites, each
+split evenly across sites via helpers.ue_drop.UeDropper.cluster_centers, each
 cluster's members within DEVIATION_RADIUS_FRAC_AREA of its center), not
 uniformly at random -- so this script's population matches the mobility
 script's population structure exactly, just held at one snapshot instead of
@@ -51,7 +51,7 @@ from sionna.phy.constants import BOLTZMANN_CONSTANT
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from helpers.cellular_topology import CellularTopology
-from helpers.ue_drop import sample_cluster_center_across_sites, sample_clustered_ut_loc
+from helpers.ue_drop import UeDropper
 from helpers.utils import load_config, save_scenario, compute_cell_colors
 from helpers.electrical_downtilt import ElectricalDowntilt
 from helpers.kpi_manager import KpiManager
@@ -113,20 +113,18 @@ topo = CellularTopology(scenario_params, num_rings=NUM_RINGS, batch_size=MAX_REA
 num_bs = topo.num_bs
 
 deviation_radius = DEVIATION_RADIUS_FRAC_AREA * topo.default_drop_radius
+sampler = UeDropper(topo)
 
 
 def sample_clustered_ut_loc_batch(batch_size):
     """[batch_size, NUM_UT, 3] -- batch_size independent clustered drops,
     each with its own FRESH cluster centers (not shared across the batch),
-    matching how sample_uniform_ut_loc(..., batch_size=...) drew an
+    matching how UeDropper.uniform(..., batch_size=...) drew an
     independent uniform snapshot per batch element."""
     ut_locs = []
     for _ in range(batch_size):
-        start_xy_list = sample_cluster_center_across_sites(topo, NUM_GROUPS)
-        ut_loc_b, _ = sample_clustered_ut_loc(
-            topo, start_xy_list, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT,
-            dtype=topo.bs_loc.dtype, device=topo.bs_loc.device,
-        )
+        start_xy_list = sampler.cluster_centers(NUM_GROUPS)
+        ut_loc_b, _ = sampler.clustered(start_xy_list, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT)
         ut_locs.append(ut_loc_b)
     return torch.stack(ut_locs, dim=0)
 
@@ -140,11 +138,9 @@ in_state = torch.zeros(MAX_REALIZATION_CUDA, NUM_UT, dtype=torch.bool,
 
 # Representative snapshot for the scenario.png setup plot -- the pooled
 # sweep below draws its own fresh clustered UE positions every chunk.
-_snapshot_start_xy = sample_cluster_center_across_sites(topo, NUM_GROUPS)
-_snapshot_ut_loc, _snapshot_member_group_idx = sample_clustered_ut_loc(
-    topo, _snapshot_start_xy, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT,
-    dtype=topo.bs_loc.dtype, device=topo.bs_loc.device,
-)
+_snapshot_start_xy = sampler.cluster_centers(NUM_GROUPS)
+_snapshot_ut_loc, _snapshot_member_group_idx = sampler.clustered(
+    _snapshot_start_xy, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT)
 _cluster_colors, _ = compute_cell_colors(_snapshot_start_xy, topo.site_loc, topo.num_sectors_per_site)
 _snapshot_colors = [_cluster_colors[g] for g in _snapshot_member_group_idx.tolist()]
 save_scenario(os.path.join(OUT_DIR, "scenario.png"), topo.grid, _snapshot_ut_loc, colors=_snapshot_colors,
@@ -175,7 +171,8 @@ noise_power_w = BOLTZMANN_CONSTANT * TEMPERATURE * channel_bandwidth_hz
 bs_xy = topo.bs_loc[0, :, :2].detach()
 
 large_scale_channel = LargeScaleChannel(channel_model)
-kpi_calc = KpiManager(sector_etilts, bs_tx_power_w, noise_power_w, bs_xy)
+kpi_calc = KpiManager(sector_etilts, bs_tx_power_w, noise_power_w, bs_xy,
+                      topo.neighbor_ids, topo.max_neighbors, topo.sector_adjacency)
 
 
 def build_power_table_crn(tilt_values, total_realizations, max_realization_cuda):

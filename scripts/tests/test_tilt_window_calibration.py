@@ -51,7 +51,7 @@ from helpers.electrical_downtilt import ElectricalDowntilt
 from helpers.kpi_manager import KpiManager
 from helpers.large_scale_channel import LargeScaleChannel
 from helpers.mobility import ReferencePointGroupMobility
-from helpers.ue_drop import sample_cluster_center_across_sites, sample_clustered_ut_loc
+from helpers.ue_drop import UeDropper
 from helpers.tilt_controller import LocalTiltSelector
 
 sionna.phy.config.seed = 42
@@ -141,7 +141,8 @@ def configure_simulation():
     noise_power_w = BOLTZMANN_CONSTANT * TEMPERATURE * channel_bandwidth_hz
     bs_xy = topology.bs_loc[0, :, :2].detach()
     large_scale_channel = LargeScaleChannel(channel_model)
-    kpi_calculator = KpiManager(sector_etilts, bs_tx_power_w, noise_power_w, bs_xy)
+    kpi_calculator = KpiManager(sector_etilts, bs_tx_power_w, noise_power_w, bs_xy,
+                                topology.neighbor_ids, topology.max_neighbors, topology.sector_adjacency)
 
     ut_orientations = torch.zeros(MAX_REALIZATION_CUDA, NUM_UT, 3,
                                   dtype=topology.bs_loc.dtype, device=topology.bs_loc.device)
@@ -156,13 +157,12 @@ def build_mobility_list(topology, min_speed, max_speed):
     pooled realization, matching test_dynamic_scenario_tilts_effect.py's
     pattern."""
     mobility_list = []
+    sampler = UeDropper(topology)
     for _ in range(NUM_REALIZATIONS_PER_SLOT):
-        start_xy_list = sample_cluster_center_across_sites(topology, NUM_GROUPS)
+        start_xy_list = sampler.cluster_centers(NUM_GROUPS)
         deviation_radius = DEVIATION_RADIUS_FRAC_AREA * topology.default_drop_radius
-        initial_ut_loc, member_group_idx = sample_clustered_ut_loc(
-            topology, start_xy_list, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT,
-            dtype=topology.bs_loc.dtype, device=topology.bs_loc.device,
-        )
+        initial_ut_loc, member_group_idx = sampler.clustered(
+            start_xy_list, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT)
         mobility_list.append(ReferencePointGroupMobility(
             initial_ut_loc, member_group_idx, start_xy_list,
             deviation_radius=deviation_radius, topo=topology,

@@ -28,7 +28,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 import sionna
 from sionna.phy.channel.utils import set_3gpp_scenario_parameters
 from helpers.cellular_topology import CellularTopology
-from helpers.ue_drop import sample_uniform_ut_loc, sample_clustered_ut_loc, sample_valid_offset
+from helpers.ue_drop import UeDropper
 from helpers.utils import load_config, save_scenario, plot_scenario, add_cluster_ellipses, compute_cell_colors
 from helpers.mobility import ReferencePointGroupMobility, RandomWalkMobility
 
@@ -73,30 +73,13 @@ deviation_radius = DEVIATION_RADIUS_FRAC_AREA * topo.default_drop_radius
 print(f"Scenario: {NUM_RINGS} ring(s), {topo.num_cells} sites, {topo.num_bs} sectors, "
      f"ISD={isd_m:.0f} m, deviation_radius={deviation_radius:.1f} m")
 
-# Split NUM_GROUPS as evenly as possible across every site, and scatter each
-# site's share of cluster centers uniformly within that site's own cell (a
-# disk of its hex circumradius around the site, rejected against the real
-# coverage footprint) -- a controlled, roughly-even number of clusters per
-# cell, not one cluster per site.
-num_cells = topo.num_cells
-base, extra = divmod(NUM_GROUPS, num_cells)
-clusters_per_site = [base + 1 if site_idx < extra else base for site_idx in range(num_cells)]
-cell_radius = float(topo.grid.cell_radius.item())
-start_xy_list = []
-for site_idx, n_clusters in enumerate(clusters_per_site):
-    if n_clusters == 0:
-        continue
-    site_center = topo.site_loc[site_idx:site_idx + 1].expand(n_clusters, -1)
-    cluster_xy = sample_valid_offset(
-        site_center, cell_radius, topo, topo.bs_loc.dtype, topo.bs_loc.device,
-    )
-    start_xy_list.extend(tuple(xy) for xy in cluster_xy.tolist())
+sampler = UeDropper(topo)
 
-# Initial (t=0) clustered UE drop 
-ut_loc, member_group_idx = sample_clustered_ut_loc(
-    topo, start_xy_list, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT,
-    dtype=topo.bs_loc.dtype, device=topo.bs_loc.device,
-)
+# Cluster centers split evenly across sites, then evenly across each site's sectors
+start_xy_list = sampler.cluster_centers(NUM_GROUPS)
+
+# Initial (t=0) clustered UE drop
+ut_loc, member_group_idx = sampler.clustered(start_xy_list, MEMBERS_PER_GROUP, deviation_radius, UT_HEIGHT)
 
 # RPGM
 rpgm = ReferencePointGroupMobility(
@@ -106,8 +89,7 @@ rpgm = ReferencePointGroupMobility(
 )
 
 # Initial (t=0) uniform UE drop
-random_walk_init_loc = sample_uniform_ut_loc(topo, NUM_UT, UT_HEIGHT, dtype=topo.bs_loc.dtype,
-                                             device=topo.bs_loc.device)
+random_walk_init_loc = sampler.uniform(NUM_UT, UT_HEIGHT)
 
 # Random Walk mobility model
 random_walk = RandomWalkMobility(random_walk_init_loc, topo=topo,
