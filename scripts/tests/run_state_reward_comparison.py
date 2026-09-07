@@ -13,10 +13,11 @@ mobility/channel), so any one run's copy works for comparison.
 
 Run: python scripts/tests/run_state_reward_comparison.py <tag> <state_type> <reward_type> <optimization_enabled 0|1> [policy_name]
 
-policy_name defaults to whatever config.yaml has (independent-dqn) --
+policy_name defaults to whatever config.yaml has (dqn) --
 pass "random" to run the no-learning baseline instead.
 """
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -27,14 +28,26 @@ import numpy as np
 import sionna
 import torch
 
-from helpers.utils import load_config
+from helpers.utils import LiveMetricsPlot, RepoLogging, get_logger, load_config
 from helpers.simulation_engine import SimulationEngine
 
 sionna.phy.config.precision = "single"
 sionna.phy.config.device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-TAG, STATE_TYPE, REWARD_TYPE, OPTIMIZATION_ENABLED = sys.argv[1], sys.argv[2], sys.argv[3], bool(int(sys.argv[4]))
-POLICY_NAME = sys.argv[5] if len(sys.argv) > 5 else None
+_parser = argparse.ArgumentParser()
+_parser.add_argument("tag")
+_parser.add_argument("state_type")
+_parser.add_argument("reward_type")
+_parser.add_argument("optimization_enabled", type=int)
+_parser.add_argument("policy_name", nargs="?", default=None)
+RepoLogging.add_argument(_parser)
+_args = _parser.parse_args()
+
+TAG, STATE_TYPE, REWARD_TYPE, OPTIMIZATION_ENABLED = _args.tag, _args.state_type, _args.reward_type, bool(_args.optimization_enabled)
+POLICY_NAME = _args.policy_name
+
+RepoLogging.configure(_args.log_level, overrides=RepoLogging.parse_overrides(_args.log_level_override))
+logger = get_logger(__name__)
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "state_reward_comparison", TAG)
 
@@ -54,12 +67,17 @@ sionna.phy.config.seed = SIMULATION_CFG["environment_seed"]
 
 
 def main():
+    logger.function(f"main start: tag={TAG}")
     os.makedirs(OUT_DIR, exist_ok=True)
-    print(f"[{TAG}] policy_name={DRL_CFG['policy_name']} state_type={STATE_TYPE} reward_type={REWARD_TYPE} "
-         f"optimization_enabled={OPTIMIZATION_ENABLED} intervals={SIMULATION_CFG['num_tilt_control_intervals']}")
+    logger.info(f"[{TAG}] policy_name={DRL_CFG['policy_name']} state_type={STATE_TYPE} reward_type={REWARD_TYPE} "
+               f"optimization_enabled={OPTIMIZATION_ENABLED} intervals={SIMULATION_CFG['num_tilt_control_intervals']}")
 
     engine = SimulationEngine(CFG)
-    results = engine.run_simulation()
+    logger.debug(f"[{TAG}] engine constructed, num_bs={engine.num_bs}")
+    live_plot = LiveMetricsPlot(OUT_DIR)
+    results = engine.run_simulation(live_plot=live_plot)
+    live_plot.close()
+    logger.debug(f"[{TAG}] run_simulation done, live_plot closed")
 
     coverage_dynamic_local_oracle = results["coverage_dynamic_local_oracle"]
     coverage_dynamic_local_causal = results["coverage_dynamic_local_causal"]
@@ -71,20 +89,22 @@ def main():
     drl_loss_per_interval = results["drl_loss_per_interval"]
     drl_tilt_deg_history = results["drl_tilt_deg_history"]
     drl_policy = results["drl_policy"]
+    logger.debug(f"[{TAG}] results dict unpacked")
 
     steady_state_episodes = SIMULATION_CFG["steady_state_episodes"]
     steady = slice(-steady_state_episodes, None)
-    print(
+    logger.info(
         f"[{TAG}] Mean coverage (full run): adaptive_legacy={coverage_adaptive_legacy.mean():.4f}, "
         f"no_tilt={coverage_no_tilt.mean():.4f}, drl={coverage_drl.mean():.4f}"
     )
-    print(
+    logger.info(
         f"[{TAG}] Mean coverage (last {steady_state_episodes} intervals -- steady state): "
         f"adaptive_legacy={coverage_adaptive_legacy[steady].mean():.4f}, "
         f"no_tilt={coverage_no_tilt[steady].mean():.4f}, drl={coverage_drl[steady].mean():.4f}"
     )
 
     drl_policy.save(Path(OUT_DIR) / "drl_policy.pt")
+    logger.info(f"[{TAG}] Saved DRL policy: {Path(OUT_DIR) / 'drl_policy.pt'}")
 
     data_path = os.path.join(OUT_DIR, "data.npz")
     np.savez(
@@ -108,10 +128,11 @@ def main():
         reward_type=REWARD_TYPE,
         optimization_enabled=OPTIMIZATION_ENABLED,
         policy_name=DRL_CFG["policy_name"],
-        mobility_model=MOBILITY_CFG["mobility_model"],
+        mobility_model=MOBILITY_CFG["cluster_mobility_mode"],
         num_bs=engine.num_bs,
     )
-    print(f"[{TAG}] Saved: {data_path}")
+    logger.info(f"[{TAG}] Saved: {data_path}")
+    logger.function(f"main end: tag={TAG}")
 
 
 if __name__ == "__main__":

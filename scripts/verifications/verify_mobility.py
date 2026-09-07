@@ -1,18 +1,15 @@
-"""Visual verification of the mobility models in helpers/mobility.py.
+"""Visual verification of the mobility model in helpers/mobility.py.
 
 Purely geometric -- no channel/SINR computation here. This validates that the
-mobility models themselves behave correctly (clusters form, groups wander within
-the coverage area, the random-walk baseline stays in bounds) before wiring them
-into the SINR pipeline as a follow-up step.
+mobility model itself behaves correctly (clusters form, groups wander within
+the coverage area) before wiring it into the SINR pipeline as a follow-up step.
 
 Saves to results/verifications/mobility/:
-  1. initial_positions.png    -- RPGM's t=0 cluster positions, colored by group,
-                                  over the hex grid -- confirms UEs actually start
-                                  clustered (not scattered like a uniform drop).
-  2. rpgm_animation.gif       -- RPGM groups moving: each group's reference point
-                                  wanders (random-waypoint) within the coverage area.
-  3. random_walk_animation.gif -- RandomWalkMobility baseline: independent UEs
-                                  wandering/reflecting at the boundary, for comparison.
+  1. initial_positions.png -- RPGM's t=0 cluster positions, colored by group,
+                               over the hex grid -- confirms UEs actually start
+                               clustered (not scattered like a uniform drop).
+  2. rpgm_animation.gif    -- RPGM groups moving: each group's reference point
+                               wanders (random-waypoint) within the coverage area.
 
 Run: python scripts/verifications/verify_mobility.py
 """
@@ -30,7 +27,7 @@ from sionna.phy.channel.utils import set_3gpp_scenario_parameters
 from helpers.cellular_topology import CellularTopology
 from helpers.ue_drop import UeDropper
 from helpers.utils import load_config, save_scenario, plot_scenario, add_cluster_ellipses, compute_cell_colors
-from helpers.mobility import ReferencePointGroupMobility, RandomWalkMobility
+from helpers.mobility import ReferencePointGroupMobility
 
 sionna.phy.config.seed = 42
 sionna.phy.config.precision = "single"
@@ -88,13 +85,6 @@ rpgm = ReferencePointGroupMobility(
     member_jitter_speed=MEMBER_JITTER_SPEED,
 )
 
-# Initial (t=0) uniform UE drop
-random_walk_init_loc = sampler.uniform(NUM_UT, UT_HEIGHT)
-
-# Random Walk mobility model
-random_walk = RandomWalkMobility(random_walk_init_loc, topo=topo,
-                                 min_speed=MIN_SPEED, max_speed=MAX_SPEED)
-
 # Color each cluster by its (site, sector-within-site) combination -- a
 # proper map coloring, so any two geometrically adjacent cells (same site,
 # different sector, OR different but neighboring sites) always get
@@ -142,8 +132,7 @@ class _MobilityStepAnimationUpdater:
 
 def make_animation(mobility, num_slots, dt, out_path, title, cluster_radius=None, colors=None):
     """cluster_radius, if given, draws and updates one circle per cluster
-    each frame from mobility.ref_xy (RPGM only -- RandomWalkMobility has no
-    groups/reference points to draw one from)."""
+    each frame from mobility.ref_xy."""
     fig = topo.grid.show(show_sectors=True)
     ax = fig.gca()
     # grid.show()'s own layout leaves no room for a title added afterward;
@@ -172,10 +161,4 @@ make_animation(
     rpgm, NUM_SLOTS, SLOT_DURATION, os.path.join(OUT_DIR, "rpgm_animation.gif"),
     title=f"RPGM: {NUM_GROUPS} random-waypoint groups",
     cluster_radius=deviation_radius, colors=ue_colors,
-)
-
-# 3. RandomWalkMobility baseline animation
-make_animation(
-    random_walk, NUM_SLOTS, SLOT_DURATION, os.path.join(OUT_DIR, "random_walk_animation.gif"),
-    title="RandomWalkMobility baseline (ungrouped)",
 )

@@ -5,6 +5,10 @@ import math
 
 import torch
 
+from helpers.utils import get_logger
+
+logger = get_logger(__name__)
+
 
 class UeDropper:
     """simply stores the fixed context required for every UE draw.
@@ -27,6 +31,8 @@ class UeDropper:
         [rad] if both are given.
         """
 
+        logger.function("disk_offset start: radius=%.2f num_points=%d", radius, num_points)
+
         # Radius that makes the points uniformly distributed over the area of the disk
         r = radius * torch.sqrt(torch.rand(num_points, dtype=self.dtype, device=self.device, generator=self.generator))
 
@@ -37,9 +43,12 @@ class UeDropper:
             theta = 2.0 * math.pi * u
         else:  # over the sector edge
             theta = angle_center + angle_half_width * (2.0 * u - 1.0)
+        logger.debug("disk_offset: wedge_restricted=%s", angle_center is not None)
 
         # return disk offsets
-        return torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
+        offsets = torch.stack([r * torch.cos(theta), r * torch.sin(theta)], dim=-1)
+        logger.function("disk_offset end: shape=%s", tuple(offsets.shape))
+        return offsets
 
     def valid_points(self, centers: torch.Tensor, radius: float, max_rounds: int = 100,
                      min_dist_from_site: float = None, angle_center: float = None,
@@ -48,6 +57,8 @@ class UeDropper:
         that centers[i] + offset lies within the topology's real hex-grid
         footprint, rejecting and resampling per-point as needed.
         """
+        logger.function("valid_points start: num_points=%d radius=%.2f", centers.shape[0], radius)
+
         # Initialization
         xy = centers.clone()
         valid = torch.zeros(centers.shape[0], dtype=torch.bool, device=self.device)
@@ -55,7 +66,8 @@ class UeDropper:
             site_loc = self.topology.site_loc.to(dtype=self.dtype, device=self.device)
 
         # Fill up with valid points
-        for _ in range(max_rounds):
+        round_idx = 0
+        for round_idx in range(max_rounds):
             # Check for pending valid points
             if valid.all():
                 break
@@ -79,6 +91,12 @@ class UeDropper:
             # Update the valid points
             xy[pending[ok]] = candidates[ok]
             valid[pending[ok]] = True
+
+        logger.debug("valid_points: rounds_used=%d valid=%d/%d", round_idx + 1, int(valid.sum()), valid.numel())
+        if not valid.all():
+            logger.warning("valid_points: %d/%d points still invalid after max_rounds=%d",
+                          int((~valid).sum()), valid.numel(), max_rounds)
+        logger.function("valid_points end")
         return xy
 
     def uniform(self, num_ut: int, ut_height: float, disk_radius: float = None,
@@ -103,6 +121,8 @@ class UeDropper:
         """
         if batch_size is not None:
             return torch.stack([self.uniform(num_ut, ut_height, disk_radius) for _ in range(batch_size)], dim=0)
+
+        logger.function("uniform start: num_ut=%d", num_ut)
         if disk_radius is None:
             disk_radius = self.topology.default_drop_radius
 
@@ -112,7 +132,8 @@ class UeDropper:
         accepted = []
         n_accepted = 0
         max_rounds = 200
-        for _ in range(max_rounds):
+        round_idx = 0
+        for round_idx in range(max_rounds):
             if n_accepted >= num_ut:
                 break
             n_try = int((num_ut - n_accepted) * 1.5) + 8
@@ -132,10 +153,16 @@ class UeDropper:
             kept = candidates[far_enough & within_coverage]
             accepted.append(kept)
             n_accepted += kept.shape[0]
+        logger.debug("uniform: rounds_used=%d n_accepted=%d/%d", round_idx + 1, n_accepted, num_ut)
+        if round_idx + 1 >= 0.75 * max_rounds and n_accepted >= num_ut:
+            logger.warning("uniform: took %d/%d rejection rounds to fill %d UEs -- disk_radius/min_bs_ut_dist "
+                          "margin is getting tight", round_idx + 1, max_rounds, num_ut)
 
         # Repeat until enough UEs
         ut_loc_xy = torch.cat(accepted, dim=0)
         if ut_loc_xy.shape[0] < num_ut:
+            logger.warning("uniform: only %d/%d valid UE positions after %d rejection rounds",
+                          ut_loc_xy.shape[0], num_ut, max_rounds)
             raise RuntimeError(
                 f"Could not sample {num_ut} valid UE positions after {max_rounds} "
                 "rejection rounds -- disk_radius may be too small relative to "
@@ -143,17 +170,28 @@ class UeDropper:
             )
         ut_loc_xy = ut_loc_xy[:num_ut]
         z = torch.full((num_ut, 1), float(ut_height), dtype=self.dtype, device=self.device)
-        return torch.cat([ut_loc_xy, z], dim=-1)  # [num_ut, 3]
+        result = torch.cat([ut_loc_xy, z], dim=-1)  # [num_ut, 3]
+        logger.function("uniform end: result shape=%s", tuple(result.shape))
+        return result
 
-    def cluster_centers(self, num_groups: int):
+    def cluster_centers(self, num_groups: int, min_dist_from_site: float = None):
         """``num_groups`` cluster-center (x, y) positions, split as evenly as
         possible across the topology's sites, then across each site's sectors.
+
+        :param min_dist_from_site: defaults to topology.min_bs_ut_dist --
+            pass a larger, buffered value (e.g. min_bs_ut_dist + a cluster
+            radius cap) to keep the WHOLE cluster disk centered here outside
+            the exclusion zone, not just this one center point.
         """
+        logger.function("cluster_centers start: num_groups=%d", num_groups)
+
         # Initialization
         topology = self.topology
         num_cells = topology.num_cells
         num_sectors_per_site = topology.num_sectors_per_site
         cell_radius = float(topology.grid.cell_radius.item())
+        if min_dist_from_site is None:
+            min_dist_from_site = topology.min_bs_ut_dist
 
         # Distribute clusters across sites
         base, extra = divmod(num_groups, num_cells)
@@ -186,8 +224,11 @@ class UeDropper:
                 cluster_xy = self.valid_points(
                     centers, cell_radius,
                     angle_center=float(sector_yaws[k]), angle_half_width=wedge_half_width,
+                    min_dist_from_site=min_dist_from_site,
                 )
                 start_xy_list.extend(tuple(xy) for xy in cluster_xy.tolist())
+        logger.debug("cluster_centers: generated %d cluster centers", len(start_xy_list))
+        logger.function("cluster_centers end")
         return start_xy_list
 
     def clustered(self, cluster_centers, members_per_cluster, deviation_radius: float, ut_height: float):
@@ -202,6 +243,8 @@ class UeDropper:
             giving which cluster each member belongs to, in the same order as
             ``cluster_centers``).
         """
+        logger.function("clustered start: num_clusters=%d", len(cluster_centers))
+
         # Initialization
         centers = torch.as_tensor(cluster_centers, dtype=self.dtype, device=self.device)
         num_clusters = centers.shape[0]
@@ -223,5 +266,7 @@ class UeDropper:
 
         # Update UE locations
         ut_loc = torch.cat([xy, z], dim=-1)
-        
+
+        logger.debug("clustered: ut_loc shape=%s", tuple(ut_loc.shape))
+        logger.function("clustered end")
         return ut_loc, member_cluster_idx

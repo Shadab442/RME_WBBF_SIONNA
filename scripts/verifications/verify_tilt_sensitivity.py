@@ -18,9 +18,11 @@ out to be a near-meaningless bar (any location near a plausible SINR range
 will occasionally cross a threshold by chance given enough draws); the
 flip RATE is what actually answers "does tilt matter here."
 
-This directly informs top_k_neighbor's top_k_locations config value (see
-config.yaml) -- see project_drl_state_taxonomy_v2 memory for how the
-number 10 was chosen from an earlier run of this same check.
+Originally informed top_k_neighbor's top_k_locations config value (see
+project_drl_state_taxonomy_v2 memory for how the number 10 was chosen) --
+that state design has since been replaced by region_57, so this script is
+now a general sensitivity diagnostic rather than something a live config
+value depends on.
 
 Run: python scripts/verifications/verify_tilt_sensitivity.py
 
@@ -100,7 +102,6 @@ def evaluate_flip_rates(engine: SimulationEngine, ut_height: float) -> np.ndarra
 
 def main():
     cfg = load_config()
-    cfg["algorithms"]["drl"]["state_type"] = "top_k_neighbor"  # only to build the grid; no training happens
     torch.manual_seed(0)
     engine = SimulationEngine(cfg)
 

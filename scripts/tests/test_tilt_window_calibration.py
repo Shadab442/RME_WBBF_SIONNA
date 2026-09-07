@@ -56,7 +56,7 @@ from helpers.tilt_controller import LocalTiltSelector
 
 sionna.phy.config.seed = 42
 sionna.phy.config.precision = "single"
-DEVICE = "cuda:0" if torch.cuda.is_available() else "cuda:0"
+DEVICE = "cuda:0" if torch.cuda.is_available() else "cpu"
 sionna.phy.config.device = DEVICE
 
 OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "results", "tests", "tilt_window_calibration")
@@ -86,12 +86,15 @@ DEVIATION_RADIUS_FRAC_AREA = CFG["mobility"]["deviation_radius_frac_area"]
 MEMBER_JITTER_SPEED = CFG["mobility"]["member_jitter_speed"]
 
 MEASUREMENT_INTERVAL_S = CFG["simulation"]["measurement_interval_s"]
-NUM_REALIZATIONS_PER_SLOT = CFG["simulation"]["num_realizations_per_slot"]
 MAX_REALIZATION_CUDA = CFG["simulation"]["max_realization_cuda"]
 
 CANDIDATE_WINDOW_SLOTS = CALIBRATION_CFG["candidate_window_slots"]
 NUM_WINDOWS_PER_CANDIDATE = CALIBRATION_CFG["num_windows_per_candidate"]
 MOBILITY_SPEED_SETTINGS = CALIBRATION_CFG["mobility_speed_settings"]
+# This script's OWN calibration realization count -- not simulation's
+# production num_realizations_per_slot; the two are configured separately
+# and silently disagree in config.yaml (5 here vs. 1 in production).
+NUM_REALIZATIONS_PER_SLOT = CALIBRATION_CFG["num_realizations_per_slot"]
 
 assert NUM_UT % NUM_GROUPS == 0, "NUM_UT must be divisible by NUM_GROUPS for equal-sized RPGM groups"
 assert NUM_REALIZATIONS_PER_SLOT % MAX_REALIZATION_CUDA == 0, \

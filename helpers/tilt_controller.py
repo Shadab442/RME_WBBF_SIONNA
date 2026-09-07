@@ -32,6 +32,10 @@ the stateless search algorithms a ``SearchTiltController`` wraps and owns
 
 import numpy as np
 
+from helpers.utils import get_logger
+
+logger = get_logger(__name__)
+
 
 class TiltController:
     """Common lifecycle every per-sector tilt controller in this project
@@ -141,12 +145,15 @@ class AdaptiveLegacyTiltController(TiltController):
             with no real observation this interval (e.g. zero served UEs). 
             That sector's tilt is reset to 0 deg
         """
+        logger.function("AdaptiveLegacyTiltController.update start")
         n_os = np.nan_to_num(overshoot_per_sector, nan=0.0)
         r_bc = 1.0 - np.nan_to_num(per_sector_coverage, nan=0.0)
 
         # Status check
         interference_problem = n_os > self.os_threshold
         coverage_problem = r_bc > self.bc_threshold
+        logger.debug("AdaptiveLegacyTiltController.update: interference_problem=%d coverage_problem=%d sectors",
+                    int(interference_problem.sum()), int(coverage_problem.sum()))
 
         # Increasing downtilt solves overshoot
         increase_downtilt = interference_problem & ~coverage_problem
@@ -157,10 +164,16 @@ class AdaptiveLegacyTiltController(TiltController):
         # Final tilt
         delta_tilt = increase_downtilt * self.tilt_step_deg + decrease_downtilt * (-self.tilt_step_deg)
         self.tilt_deg = np.clip(self.tilt_deg + delta_tilt, self.theta_min_deg, self.theta_max_deg)
+        logger.debug("AdaptiveLegacyTiltController.update: %d sectors changed tilt",
+                    int((delta_tilt != 0).sum()))
 
         if has_data is not None:
             self.tilt_deg = np.where(has_data, self.tilt_deg, 0.0)
+            if not has_data.all():
+                logger.warning("AdaptiveLegacyTiltController.update: %d sector(s) with no data, tilt reset to 0",
+                              int((~has_data).sum()))
 
+        logger.function("AdaptiveLegacyTiltController.update end")
         return self.tilt_deg
 
 
@@ -171,14 +184,17 @@ class GlobalTiltSelector:
     """
 
     def select(self, kpi_manager, power_table: np.ndarray, threshold_db: float, warm_start=None) -> np.ndarray:
+        logger.function("GlobalTiltSelector.select start")
         num_tilts, num_sectors = power_table.shape[0], power_table.shape[2]
         coverages = np.array([
             kpi_manager.compute_ue_kpis(power_table, np.full(num_sectors, t, dtype=int), threshold_db)["coverage"]
             for t in range(num_tilts)
         ])
+        logger.debug("GlobalTiltSelector.select: coverages=%s", coverages.tolist())
 
         # Best global tilt
         best_t = int(np.argmax(coverages))
+        logger.function("GlobalTiltSelector.select end: best_t=%d", best_t)
         return np.full(num_sectors, best_t, dtype=int)
 
 
@@ -199,6 +215,7 @@ class LocalTiltSelector:
         self.last_coverage_trace = None
 
     def select(self, kpi_manager, power_table: np.ndarray, threshold_db: float, warm_start=None) -> np.ndarray:
+        logger.function("LocalTiltSelector.select start: max_rounds=%d", self.max_rounds)
         num_tilts, num_sectors = power_table.shape[0], power_table.shape[2]
         if warm_start is None:
             warm_start = GlobalTiltSelector().select(kpi_manager, power_table, threshold_db)
@@ -228,6 +245,11 @@ class LocalTiltSelector:
 
         self.last_num_rounds = num_rounds_run
         self.last_coverage_trace = np.array(coverage_trace)
+        converged = num_rounds_run < self.max_rounds
+        logger.debug("LocalTiltSelector.select: num_rounds_run=%d converged=%s", num_rounds_run, converged)
+        if not converged:
+            logger.warning("LocalTiltSelector.select: did not converge within max_rounds=%d", self.max_rounds)
+        logger.function("LocalTiltSelector.select end")
         return assignment
 
 
@@ -247,7 +269,9 @@ class SearchTiltController(TiltController):
         self.assignment = None
 
     def initial_select(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
+        logger.function("SearchTiltController.initial_select start")
         self.assignment = self.selector.select(kpi_manager, power_table, threshold_db)
+        logger.function("SearchTiltController.initial_select end")
         return self.assignment
 
     def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
@@ -261,9 +285,14 @@ class StaticTiltController(SearchTiltController):
     """
 
     def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
+        logger.function("StaticTiltController.update start")
         if self.assignment is None:
-            return self.initial_select(kpi_manager, power_table, threshold_db)
-        return self.assignment
+            logger.debug("StaticTiltController.update: no assignment yet, calibrating")
+            result = self.initial_select(kpi_manager, power_table, threshold_db)
+        else:
+            result = self.assignment
+        logger.function("StaticTiltController.update end")
+        return result
 
 
 class DynamicTiltController(SearchTiltController):
@@ -272,10 +301,15 @@ class DynamicTiltController(SearchTiltController):
     """
 
     def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
+        logger.function("DynamicTiltController.update start")
         if self.assignment is None:
-            return self.initial_select(kpi_manager, power_table, threshold_db)
-        self.assignment = self.selector.select(kpi_manager, power_table, threshold_db, warm_start=self.assignment)
-        return self.assignment
+            result = self.initial_select(kpi_manager, power_table, threshold_db)
+        else:
+            self.assignment = self.selector.select(kpi_manager, power_table, threshold_db,
+                                                    warm_start=self.assignment)
+            result = self.assignment
+        logger.function("DynamicTiltController.update end")
+        return result
 
 
 class RLTiltController(TiltController):
@@ -284,8 +318,19 @@ class RLTiltController(TiltController):
     :ivar tilt_idx: [num_sectors] current tilt INDEX -- the action currently in effect.
     """
 
-    def __init__(self, policy, num_sectors: int, initial_tilt_idx: int = 0):
+    def __init__(self, policy, num_sectors: int, initial_tilt_idx: int = 0, variable_size: bool = False):
+        """:param variable_size: if True, observations are a per-sector
+            LIST of possibly different-length 1D arrays (e.g. sectors with
+            fewer than 4 neighbors getting a smaller state) rather than one
+            dense [num_sectors, num_features] array -- policy.act()/observe()
+            already index one sector at a time so they need no change, but
+            this class's own _prev_observations bookkeeping (normally a
+            single dense array with boolean-mask batch updates, which
+            requires uniform per-sector width) switches to an explicit
+            per-sector list with per-sector loops instead.
+        """
         self.policy = policy
+        self.variable_size = variable_size
         self.tilt_idx = np.full(num_sectors, initial_tilt_idx, dtype=np.int64)
         self._prev_observations = None
         self._prev_actions = np.zeros(num_sectors, dtype=np.int64)
@@ -299,8 +344,10 @@ class RLTiltController(TiltController):
               has_data: np.ndarray = None, schedule: np.ndarray = None,
               terminal: bool = False) -> np.ndarray:
         """
-        :param observations: [num_sectors, num_features] -- only rows for
-            scheduled sectors need be meaningful this call.
+        :param observations: [num_sectors, num_features] dense array, OR --
+            if variable_size -- a [num_sectors] list of per-sector 1D
+            arrays (possibly different widths). Only entries for scheduled
+            sectors need be meaningful this call.
         :param rewards: [num_sectors], only meaningful for scheduled
             sectors -- reward from each scheduled sector's own previously
             stored action.
@@ -316,32 +363,46 @@ class RLTiltController(TiltController):
             sector's window hasn't closed yet this call; it holds
             ``self.tilt_idx`` unchanged and its stored previous-state is
             left untouched. A scheduled sector with no data (has_data
-            False) falls back to index 0 (0 deg).
+            False) also holds its previous tilt -- same fallback as "not
+            scheduled", just for a different reason (nothing meaningful to
+            decide from, rather than not yet due).
         """
+        logger.function("RLTiltController.update start: training=%s terminal=%s", training, terminal)
         num_sectors = len(observations)
         if has_data is None:
             has_data = np.ones(num_sectors, dtype=bool)
         if schedule is None:
             schedule = np.ones(num_sectors, dtype=bool)
+        logger.debug("RLTiltController.update: scheduled=%d/%d has_data=%d/%d",
+                    int(schedule.sum()), num_sectors, int(has_data.sum()), num_sectors)
 
         if training and self._prev_observations is not None and schedule.any():
             transition_valid = schedule & self._prev_valid & has_data
             if transition_valid.any():
                 self.policy.observe(self._prev_observations, self._prev_actions, rewards,
                                    observations, terminal, mask=transition_valid)
+                logger.debug("RLTiltController.update: observed %d valid transitions",
+                            int(transition_valid.sum()))
 
         # Only a scheduled sector with real data gets to pick a new tilt;
+        # every other masked sector (not yet scheduled, OR scheduled but
+        # dataless) holds its previous tilt via default_action=self.tilt_idx.
         act_mask = schedule & has_data
         actions = self.policy.act(observations, training, mask=act_mask, default_action=self.tilt_idx)
 
-        # a scheduled-but-dataless one falls back to index 0.
         if self._prev_observations is None:
-            self._prev_observations = np.zeros_like(observations)
+            self._prev_observations = [None] * num_sectors if self.variable_size else np.zeros_like(observations)
 
         # Only scheduled sectors' stored state advances this call
-        self._prev_observations[schedule] = observations[schedule]
+        if self.variable_size:
+            for i in range(num_sectors):
+                if schedule[i]:
+                    self._prev_observations[i] = observations[i]
+        else:
+            self._prev_observations[schedule] = observations[schedule]
         self._prev_actions[schedule] = actions[schedule]
         self._prev_valid[schedule] = has_data[schedule]
         self.tilt_idx[schedule] = actions[schedule]
-        
+
+        logger.function("RLTiltController.update end")
         return self.tilt_idx

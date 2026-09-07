@@ -20,6 +20,7 @@ the hexagon and sector geometry -- but it doesn't plot UE positions.
     passed straight to ``scatter(..., c=colors, cmap="tab10")``.
 """
 
+import logging
 import math
 import os
 
@@ -37,6 +38,107 @@ def load_config() -> dict:
         return yaml.safe_load(f)
 
 
+# Between INFO (20) and DEBUG (10) -- entry/exit of a repo-level function or
+# computational block, one step more granular than INFO's "major stage"
+# without the per-logical-block detail of DEBUG.
+FUNCTION = 15
+logging.addLevelName(FUNCTION, "FUNCTION")
+
+
+def _log_function(self, message, *args, **kwargs):
+    if self.isEnabledFor(FUNCTION):
+        # stacklevel=2: attribute the log record to logger.function()'s
+        # CALLER, not this wrapper -- otherwise %(funcName)s/%(name)s would
+        # always say "_log_function" instead of the real function.
+        kwargs.setdefault("stacklevel", 2)
+        self._log(FUNCTION, message, args, **kwargs)
+
+
+logging.Logger.function = _log_function
+
+
+class RepoLogging:
+    """Centralized logging configuration for this repo: one shared
+    handler/format/level on the root logger, configured ONCE by each
+    entry-point script's argparse (see add_argument()/configure()) --
+    every other module just calls ``logger = get_logger(__name__)`` and
+    logs, with no per-module setup.
+
+    Levels (see config.yaml-adjacent docs / CLI --log-level):
+        WARNING (30) -- abnormal but recoverable: suspicious values,
+            fallbacks, numerical issues.
+        INFO    (20) -- high-level experiment/simulation progress,
+            configuration, selected methods, major stages, saved outputs.
+        FUNCTION(15) -- entry/exit of important repo-level functions and
+            computational blocks.
+        DEBUG   (10) -- detailed diagnostics: shapes, intermediate
+            SINR/power values, indexing, scheduler outputs, numerical stats.
+    """
+
+    LEVELS = {"WARNING": logging.WARNING, "INFO": logging.INFO,
+             "FUNCTION": FUNCTION, "DEBUG": logging.DEBUG}
+    _configured = False
+
+    @classmethod
+    def configure(cls, level: str = "INFO", overrides: dict = None) -> None:
+        """Attach one formatted StreamHandler to the root logger (once per
+        process) and set its level -- call this exactly once, at each
+        entry-point script's startup, before constructing anything.
+
+        :param overrides: {logger_name: level_name}, e.g.
+            {"helpers.kpi_manager": "DEBUG"} -- gives that module (and
+            anything under it) its OWN level, independent of `level`, so
+            one file can run more (or less) verbose than the rest without
+            paying for full-repo DEBUG output. The handler itself has no
+            level filter, so an override can go either more or less verbose
+            than the root in either direction.
+        """
+        if not cls._configured:
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter(
+                fmt="%(asctime)s | %(levelname)-8s | %(name)s.%(funcName)s | %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            logging.getLogger().addHandler(handler)
+            cls._configured = True
+        logging.getLogger().setLevel(cls.LEVELS[level])
+        for name, override_level in (overrides or {}).items():
+            logging.getLogger(name).setLevel(cls.LEVELS[override_level])
+
+    @staticmethod
+    def add_argument(parser) -> None:
+        """Adds --log-level {WARNING,INFO,FUNCTION,DEBUG} (default INFO) and
+        repeatable --log-level-override MODULE=LEVEL to an
+        argparse.ArgumentParser -- pass the latter's parsed list through
+        parse_overrides() before handing it to configure()."""
+        parser.add_argument("--log-level", choices=list(RepoLogging.LEVELS), default="INFO",
+                            help="Logging verbosity (default: INFO).")
+        parser.add_argument("--log-level-override", action="append", default=[], metavar="MODULE=LEVEL",
+                            help="Per-module level override, e.g. helpers.kpi_manager=DEBUG. "
+                                "Repeatable for multiple modules.")
+
+    @staticmethod
+    def parse_overrides(raw_overrides: list) -> dict:
+        """Turns ["helpers.kpi_manager=DEBUG", ...] (as collected by
+        --log-level-override) into {"helpers.kpi_manager": "DEBUG", ...}
+        for configure()'s `overrides`."""
+        overrides = {}
+        for item in raw_overrides:
+            name, sep, level = item.partition("=")
+            if not sep or level not in RepoLogging.LEVELS:
+                raise ValueError(f"--log-level-override must be MODULE=LEVEL with LEVEL in "
+                                f"{list(RepoLogging.LEVELS)}; got {item!r}")
+            overrides[name] = level
+        return overrides
+
+
+def get_logger(name: str) -> logging.Logger:
+    return logging.getLogger(name)
+
+
+logger = get_logger(__name__)
+
+
 # Enough visually-distinct colors for any realistic num_site_colors * 3
 # (sector-within-site) combinations -- a hex grid's site-adjacency graph
 # rarely needs more than 3-4 colors even for many rings, so 4*3=12 covers it.
@@ -45,6 +147,30 @@ _SECTOR_COLOR_PALETTE = [
     "tab:brown", "tab:pink", "tab:gray", "tab:olive", "tab:cyan",
     "navy", "darkgreen",
 ]
+
+
+def greedy_graph_coloring(adjacent: np.ndarray) -> np.ndarray:
+    """Welsh-Powell greedy graph coloring: any two adjacent nodes always get
+    different color indices, using only as many colors as the graph's
+    structure actually requires (not a hardcoded/generous count) -- e.g. 3
+    for a single ring's wheel-shaped site graph regardless of how many
+    total nodes there are further out.
+
+    :param adjacent: [num_nodes, num_nodes] bool, symmetric, diagonal False.
+    :output: [num_nodes] int array of 0-based color indices.
+    """
+    num_nodes = adjacent.shape[0]
+    colors = -np.ones(num_nodes, dtype=int)
+    # Color highest-degree nodes first -- tends to need fewer total colors
+    # than a naive index-order pass.
+    order = np.argsort(-adjacent.sum(axis=1))
+    for node in order:
+        used_by_neighbors = set(colors[adjacent[node]].tolist()) - {-1}
+        c = 0
+        while c in used_by_neighbors:
+            c += 1
+        colors[node] = c
+    return colors
 
 
 def compute_site_coloring(site_loc) -> np.ndarray:
@@ -61,23 +187,11 @@ def compute_site_coloring(site_loc) -> np.ndarray:
     :output: [num_sites] int array of 0-based color indices.
     """
     site_loc_np = site_loc.detach().cpu().numpy() if hasattr(site_loc, "detach") else np.asarray(site_loc)
-    num_sites = site_loc_np.shape[0]
     dist = np.linalg.norm(site_loc_np[:, None, :] - site_loc_np[None, :, :], axis=-1)
     np.fill_diagonal(dist, np.inf)
     min_dist = dist.min()
     adjacent = dist <= min_dist * 1.05  # small tolerance around the true nearest-neighbor spacing
-
-    colors = -np.ones(num_sites, dtype=int)
-    # Welsh-Powell: color highest-degree sites first, tends to need fewer
-    # total colors than a naive index-order pass.
-    order = np.argsort(-adjacent.sum(axis=1))
-    for site in order:
-        used_by_neighbors = set(colors[adjacent[site]].tolist()) - {-1}
-        c = 0
-        while c in used_by_neighbors:
-            c += 1
-        colors[site] = c
-    return colors
+    return greedy_graph_coloring(adjacent)
 
 
 def compute_sector_index(xy, site_xy, num_sectors_per_site: int = 3) -> np.ndarray:
@@ -181,6 +295,79 @@ def save_scenario(path: str, grid, ut_loc=None, colors=None, dpi: int = 150, **k
     plt.close(fig)
 
 
+class LiveMetricsPlot:
+    """Reward/loss-vs-interval plot, redrawn and saved to disk every
+    update() call -- for watching a long (often headless/tmux) run's
+    training progress without waiting for it to finish or re-deriving it
+    from a live process.
+
+    :ivar path: PNG path (re)written each update.
+    """
+
+    def __init__(self, out_dir: str, filename: str = "reward_loss_live.png", update_every: int = 1,
+                moving_average_window: int = 20, xlabel: str = "tilt control interval"):
+        """
+        :param moving_average_window: reward trace is dominated by per-
+            interval noise (see project discussion) -- the raw values are
+            still plotted (faint), but a trailing moving average (bold,
+            window-sized, shrinking near the start so early points aren't
+            dropped) is what's actually meant to be read for a trend.
+        :param xlabel: x-axis is whatever update()'s `interval` counts --
+            "tilt control interval" for the real pipeline, but e.g.
+            "episode" for a non-tilt-control caller (see tests/drl/).
+        """
+        self.path = os.path.join(out_dir, filename)
+        self.update_every = update_every
+        self.moving_average_window = moving_average_window
+        self.reward_history = []  # per interval: mean reward across sectors
+        self.loss_history = []    # per interval: mean loss, nan where no training happened
+
+        self.fig, (self.ax_reward, self.ax_loss) = plt.subplots(2, 1, figsize=(8, 6), sharex=True)
+        self.reward_raw_line, = self.ax_reward.plot([], [], color="tab:blue", alpha=0.25, linewidth=1, label="raw")
+        self.reward_ma_line, = self.ax_reward.plot(
+            [], [], color="tab:blue", linewidth=2, label=f"moving avg ({moving_average_window})")
+        self.ax_reward.set_ylabel("mean reward")
+        self.ax_reward.legend(loc="best", fontsize=8)
+        self.loss_line, = self.ax_loss.plot([], [], color="tab:red")
+        self.ax_loss.set_ylabel("mean loss")
+        self.ax_loss.set_xlabel(xlabel)
+        self.fig.tight_layout()
+
+    @staticmethod
+    def _moving_average(values: list, window: int) -> np.ndarray:
+        """Trailing moving average with a shrinking window near the start
+        (index i averages over [max(0, i-window+1), i], not just the first
+        `window` points), so the line is defined from interval 0 on."""
+        values = np.asarray(values, dtype=float)
+        return np.array([values[max(0, i - window + 1):i + 1].mean() for i in range(len(values))])
+
+    def update(self, interval: int, reward_per_sector: np.ndarray, loss: float) -> None:
+        logger.function("LiveMetricsPlot.update start: interval=%d", interval)
+        self.reward_history.append(float(np.nanmean(reward_per_sector)))
+        self.loss_history.append(float(loss))
+
+        if (interval + 1) % self.update_every != 0:
+            logger.function("LiveMetricsPlot.update end: skipped (update_every)")
+            return
+
+        x = np.arange(len(self.reward_history))
+        self.reward_raw_line.set_data(x, self.reward_history)
+        self.reward_ma_line.set_data(x, self._moving_average(self.reward_history, self.moving_average_window))
+        self.ax_reward.relim()
+        self.ax_reward.autoscale_view()
+
+        self.loss_line.set_data(x, self.loss_history)
+        self.ax_loss.relim()
+        self.ax_loss.autoscale_view()
+
+        self.fig.savefig(self.path, dpi=100)
+        logger.debug("LiveMetricsPlot.update: saved to %s", self.path)
+        logger.function("LiveMetricsPlot.update end")
+
+    def close(self) -> None:
+        plt.close(self.fig)
+
+
 class _MobilityAnimationUpdater:
     """FuncAnimation callback (frame -> updated artists) for
     save_mobility_animation -- a class instead of a closure so per-frame
@@ -227,7 +414,8 @@ def save_mobility_animation(cfg, out_dir, topology, position_history, ref_xy_his
     more clusters than a colormap can distinguish) or recomputing every
     frame (which would make colors flicker as clusters cross boundaries).
     """
-    mobility_model = cfg["mobility"]["mobility_model"]
+    logger.function("save_mobility_animation start")
+    mobility_model = cfg["mobility"]["cluster_mobility_mode"]
     tilt_control_interval_s = cfg["simulation"]["tilt_control_interval_s"]
     num_tilt_control_intervals = cfg["simulation"]["num_tilt_control_intervals"]
     animation_fps = cfg["simulation"].get("animation_fps", 10)
@@ -258,4 +446,5 @@ def save_mobility_animation(cfg, out_dir, topology, position_history, ref_xy_his
     path = os.path.join(out_dir, "mobility_animation.gif")
     animation.save(path, writer=PillowWriter(fps=animation_fps))
     plt.close(fig)
-    print(f"Saved: {path}")
+    logger.info(f"Saved: {path}")
+    logger.function("save_mobility_animation end")

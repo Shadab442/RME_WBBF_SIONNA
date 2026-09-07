@@ -43,7 +43,12 @@ PER_SECTOR_COVERAGE_LOCAL = data["per_sector_coverage_local"]
 
 
 def ecdf(x: np.ndarray):
-    x_sorted = np.sort(x)
+    """Empirical CDF over every sample in x, pooled -- x may carry an extra
+    leading realization axis (e.g. [num_realizations, num_ue]); flatten it
+    first, or sort()/len() would treat each realization as one point along
+    the wrong axis instead of pooling all UE samples together.
+    """
+    x_sorted = np.sort(x.reshape(-1))
     return x_sorted, np.arange(1, len(x_sorted) + 1) / len(x_sorted)
 
 

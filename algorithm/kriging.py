@@ -5,7 +5,13 @@ Process regression with an RBF kernel (matches the RBF kernel choice from
 the earlier radio-map SINR estimation design discussion).
 """
 
+import logging
+
 import numpy as np
+
+from helpers.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class OrdinaryKriging:
@@ -35,13 +41,20 @@ class OrdinaryKriging:
             caller's responsibility to avoid -- there's nothing to
             interpolate from.
         """
+        logger.function("OrdinaryKriging.predict start: n_known=%d n_target=%d",
+                        known_xy.shape[0], target_xy.shape[0])
         n = known_xy.shape[0]
         if n == 0:
+            logger.warning("OrdinaryKriging.predict: called with zero known observations")
             raise ValueError("OrdinaryKriging.predict needs at least one observation")
+        if n == 1:
+            logger.warning("OrdinaryKriging.predict: only 1 known observation -- "
+                          "degenerates to a constant predictor")
 
         # Covariance among known points, regularized
         d_known = np.linalg.norm(known_xy[:, None, :] - known_xy[None, :, :], axis=-1)
         c_known = self._covariance(d_known) + self.nugget * np.eye(n)
+        logger.debug("OrdinaryKriging.predict: c_known shape=%s", c_known.shape)
 
         # Augmented system enforcing unbiasedness (weights sum to 1)
         a = np.ones((n + 1, n + 1))
@@ -52,6 +65,11 @@ class OrdinaryKriging:
         d_target = np.linalg.norm(known_xy[:, None, :] - target_xy[None, :, :], axis=-1)  # [n, m]
         b = np.ones((n + 1, target_xy.shape[0]))
         b[:n, :] = self._covariance(d_target)
+        logger.debug("OrdinaryKriging.predict: augmented system shape=%s", a.shape)
 
         weights = np.linalg.solve(a, b)  # [n+1, m]
-        return known_values @ weights[:n, :]
+        prediction = known_values @ weights[:n, :]
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("OrdinaryKriging.predict: prediction mean=%.4f", prediction.mean())
+        logger.function("OrdinaryKriging.predict end")
+        return prediction

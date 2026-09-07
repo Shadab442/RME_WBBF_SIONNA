@@ -4,6 +4,7 @@
 #
 """Electrical downtilt (3GPP TR 38.901, clause 7.3.1) for a single-port antenna array."""
 
+import logging
 from typing import Union
 
 import torch
@@ -11,6 +12,9 @@ import torch
 from sionna.phy import PI, SPEED_OF_LIGHT
 # Re-exported for convenience -- a single antenna import surface for this repo.
 from sionna.phy.channel.tr38901 import AntennaElement, PanelArray, Antenna, AntennaArray
+from helpers.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 WINDOWS = ("rectangular", "hanning")
@@ -70,16 +74,28 @@ class ElectricalDowntilt:
         """Per-element real amplitude taper, normalized so sum(a_m^2) == 1 --
         i.e. unit total transmit power regardless of window, so switching
         window is a pure pattern-shape change, not a power change."""
+        logger.function("_compute_amplitude start: window=%s", self.window)
         dtype, device = self._element_pos_z.dtype, self._element_pos_z.device
         num_elements = self.num_elements
         if self.window == "rectangular":
             amplitude = torch.ones(num_elements, dtype=dtype, device=device)
         elif self.window == "hanning":
+            # hann_window(2, periodic=False) is [0, 0] -- normalizing an
+            # all-zero taper divides by zero and returns a nonfinite array
+            # factor. Need >=3 elements for a nonzero taper.
+            assert num_elements >= 3, \
+                f"window='hanning' needs >=3 antenna elements (got {num_elements}); a 2-element Hann " \
+                "window is all-zero and normalizing it yields NaN gains"
             amplitude = torch.hann_window(num_elements, periodic=False, dtype=dtype, device=device)
-        return amplitude / torch.sqrt(torch.sum(amplitude ** 2))
+        normalized = amplitude / torch.sqrt(torch.sum(amplitude ** 2))
+        logger.debug("_compute_amplitude: normalized amplitude shape=%s", tuple(normalized.shape))
+        logger.function("_compute_amplitude end")
+        return normalized
 
     def set_tilt(self, downtilt_deg: float) -> None:
         """Set the electrical downtilt [degrees; 0 = boresight, + = down, - = up]"""
+        logger.debug("set_tilt: %.2f -> %.2f deg", self._downtilt_deg if hasattr(self, "_downtilt_deg") else float("nan"),
+                    downtilt_deg)
         self._downtilt_deg = float(downtilt_deg)
 
     @property
@@ -103,11 +119,14 @@ class ElectricalDowntilt:
         phase, combined with the amplitude taper set by ``window``
         (uniform/1/sqrt(M) for the default "rectangular", matching eq.
         (7.3-1) exactly)."""
+        logger.function("weights start: theta_etilt_deg=%.2f", self.theta_etilt_deg)
         theta_etilt = torch.tensor(
             self.theta_etilt_deg * PI / 180.0,
             dtype=self._element_pos_z.dtype, device=self._element_pos_z.device)
         phase = -2 * PI * self._element_pos_z * torch.cos(theta_etilt)
-        return self._amplitude * torch.exp(1j * phase)
+        w = self._amplitude * torch.exp(1j * phase)
+        logger.function("weights end: shape=%s", tuple(w.shape))
+        return w
 
     def array_factor(self, theta: torch.Tensor) -> torch.Tensor:
         """|array factor|^2 as a function of zenith angle theta [radian]
@@ -119,12 +138,17 @@ class ElectricalDowntilt:
         window (e.g. "hanning") trades some of that peak gain for lower
         sidelobes, so the peak will be below M.
         """
+        logger.function("array_factor start: theta shape=%s", tuple(theta.shape))
         theta = theta.to(dtype=self._element_pos_z.dtype, device=self._element_pos_z.device)
         w = self.weights()
         phase = 2 * PI * self._element_pos_z[:, None] * torch.cos(theta)[None, :]
         steering = torch.exp(1j * phase)
         af = torch.sum(w[:, None] * steering, dim=0)
-        return torch.abs(af) ** 2
+        result = torch.abs(af) ** 2
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("array_factor: peak gain=%.4f", result.max().item())
+        logger.function("array_factor end")
+        return result
 
     def gain_pattern(self, theta: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
         """Combined element-pattern * array-factor gain (linear units)
@@ -133,6 +157,9 @@ class ElectricalDowntilt:
         pattern is just the element pattern alone; ``phi`` is passed straight
         through to the element pattern.
         """
+        logger.function("gain_pattern start: theta shape=%s phi shape=%s", tuple(theta.shape), tuple(phi.shape))
         f_theta, f_phi = self.array.ant_pol1.field(theta, phi)
         element_gain = f_theta ** 2 + f_phi ** 2
-        return element_gain * self.array_factor(theta)
+        result = element_gain * self.array_factor(theta)
+        logger.function("gain_pattern end: shape=%s", tuple(result.shape))
+        return result

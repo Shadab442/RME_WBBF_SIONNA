@@ -14,6 +14,9 @@ import torch
 
 from .electrical_downtilt import ElectricalDowntilt
 from .large_scale_channel import LargeScaleState
+from helpers.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class KpiManager:
@@ -46,6 +49,7 @@ class KpiManager:
 
     def _rx_power_now(self, state: LargeScaleState) -> np.ndarray:
         """One tilt snapshot at every sector's CURRENT tilt, [batch, sector, ue], numpy."""
+        logger.function("_rx_power_now start")
         num_sectors = len(self.sector_etilts)
         batch, num_ue = state.total_pathloss_db.shape[0], state.total_pathloss_db.shape[2]
         power = torch.zeros(batch, num_sectors, num_ue,
@@ -63,7 +67,10 @@ class KpiManager:
 
             # Rx power
             power[:, s, :] = self.tx_power_w * gain / pathloss_lin
-        return power.detach().cpu().numpy()
+        result = power.detach().cpu().numpy()
+        logger.debug("_rx_power_now: result shape=%s", result.shape)
+        logger.function("_rx_power_now end")
+        return result
 
     def resolve_power_at_tilt(self, state: LargeScaleState, tilt_deg_per_sector) -> np.ndarray:
         """Sets every sector to tilt_deg_per_sector and resolves power --
@@ -71,10 +78,13 @@ class KpiManager:
         mutated for a single-tilt resolve, so callers (IntervalMeasurementPool)
         never touch sector_etilts directly.
         """
+        logger.function("resolve_power_at_tilt start")
         tilt_list = tilt_deg_per_sector.tolist() if hasattr(tilt_deg_per_sector, "tolist") else list(tilt_deg_per_sector)
         for etilt, tilt in zip(self.sector_etilts, tilt_list):
             etilt.set_tilt(tilt)
-        return self._rx_power_now(state)
+        power = self._rx_power_now(state)
+        logger.function("resolve_power_at_tilt end")
+        return power
 
     def compute_tilt_sector_ue_rx_power(self, state: LargeScaleState, tilt_values=None) -> np.ndarray:
         """Received power [W], numpy. [batch, sector, ue] at current tilts,
@@ -83,8 +93,11 @@ class KpiManager:
         :param state: A large-scale state (see helpers.large_scale_channel)
         :param tilt_values: candidate downtilts [deg], optional
         """
+        logger.function("compute_tilt_sector_ue_rx_power start: tilt_values=%s", tilt_values)
         if tilt_values is None:
-            return self._rx_power_now(state)
+            power = self._rx_power_now(state)
+            logger.function("compute_tilt_sector_ue_rx_power end")
+            return power
 
         # Sweep: every sector set to the SAME candidate tilt per row.
         rows = []
@@ -92,7 +105,10 @@ class KpiManager:
             for etilt in self.sector_etilts:
                 etilt.set_tilt(downtilt_deg)
             rows.append(self._rx_power_now(state))
-        return np.stack(rows, axis=0)
+        result = np.stack(rows, axis=0)
+        logger.debug("compute_tilt_sector_ue_rx_power: swept table shape=%s", result.shape)
+        logger.function("compute_tilt_sector_ue_rx_power end")
+        return result
 
     def _compute_serving_sinr(self, power_w: np.ndarray, sector_axis: int = 1) -> dict:
         """Signal/interference/SINR (every candidate server's, not just the
@@ -101,13 +117,20 @@ class KpiManager:
 
         :param power_w: received power [W], sector along sector_axis
         :output: dict with sinr_db, power_db (both power_w's shape),
-            serving_idx (sector_axis removed) -- the argmax-SINR sector
+            serving_idx (sector_axis removed) -- the argmax-RSRP sector
+            (max received power, i.e. 3GPP-style attachment -- NOT
+            argmax-SINR; interference can make those disagree)
         """
+        logger.function("_compute_serving_sinr start")
         total_w = power_w.sum(axis=sector_axis, keepdims=True)
         interference_w = total_w - power_w
         sinr_db = 10.0 * np.log10(power_w / (interference_w + self.noise_power_w))
         power_db = 10.0 * np.log10(power_w)
-        serving_idx = sinr_db.argmax(axis=sector_axis)
+        serving_idx = power_db.argmax(axis=sector_axis)
+        if not np.isfinite(sinr_db).all():
+            logger.warning("_compute_serving_sinr: sinr_db contains %d non-finite value(s)",
+                          int((~np.isfinite(sinr_db)).sum()))
+        logger.function("_compute_serving_sinr end")
         return {"sinr_db": sinr_db, "power_db": power_db, "serving_idx": serving_idx}
 
     def compute_ue_kpis(self, power_w: np.ndarray, tilt_idx_per_sector=None,
@@ -144,6 +167,7 @@ class KpiManager:
             distance_threshold_m+overlap_margin_db given; raw counts too if
             return_counts.
         """
+        logger.function("compute_ue_kpis start: power_w shape=%s", power_w.shape)
 
         # Resolve a swept table down to one tilt per sector first.
         if tilt_idx_per_sector is not None:
@@ -181,9 +205,11 @@ class KpiManager:
         if threshold_db is not None:
             is_covered = sinr_db > threshold_db
             result["coverage"] = float(np.mean(is_covered))
+            logger.debug("compute_ue_kpis: overall coverage=%.4f", result["coverage"])
 
         # Stop early if UE positions are not available
         if ut_loc is None:
+            logger.function("compute_ue_kpis end: no ut_loc, early return")
             return result
 
         # UE-to-site distance
@@ -220,6 +246,9 @@ class KpiManager:
                 per_neighbor_hit = np.zeros(
                     (num_sectors, self.max_neighbors)
                 )
+
+        logger.debug("compute_ue_kpis: num_sectors=%d compute_overshoot=%s return_per_neighbor=%s",
+                    num_sectors, compute_overshoot, return_per_neighbor)
 
         # --------------------------------------------------------------
         # One main loop over sectors
@@ -331,6 +360,8 @@ class KpiManager:
                         per_neighbor_served[i, k] = hits.size
                         per_neighbor_hit[i, k] = np.sum(hits)
 
+        logger.debug("compute_ue_kpis: main loop over %d sectors done", num_sectors)
+
         # --------------------------------------------------------------
         # Save per-sector coverage results
         # --------------------------------------------------------------
@@ -340,6 +371,8 @@ class KpiManager:
             if return_counts:
                 result["per_sector_served_count"] = served_count
                 result["per_sector_covered_count"] = covered_count
+            logger.debug("compute_ue_kpis: per_sector_coverage mean=%.4f",
+                        float(np.nanmean(per_sector_coverage)))
 
         # --------------------------------------------------------------
         # Save overshoot results
@@ -355,22 +388,19 @@ class KpiManager:
             if return_per_neighbor:
                 result["per_neighbor_served_count"] = per_neighbor_served
                 result["per_neighbor_overshoot_hit_count"] = per_neighbor_hit
+            logger.debug("compute_ue_kpis: overshoot mean=%.4f", float(np.nanmean(overshoot)))
 
+        logger.function("compute_ue_kpis end")
         return result
 
 class IntervalMeasurementPool:
-    """Pools KpiManager's per-slot output two different ways, against two
-    different boundaries -- distinct enough to be their own methods, but
-    both "accumulate raw measurement draws over multiple calls, resolve
-    later" so they share one home:
-
-    - pool_measurement/pooled_interval: pools against the shared TILT-
-      CONTROL INTERVAL boundary -- used to score Oracle/Causal/Adaptive
-      Legacy/No Tilt/DRL's own per-interval logging, all against the same
-      pooled snapshot.
-    - accumulate_sector_window/resolve_sector_window: pools against DRL's
-      own per-sector STAGGERED window -- the reward signal's own rolling
-      window, reset per-sector on that sector's own async closure.
+    """Pools KpiManager's per-slot output against the shared TILT-CONTROL
+    INTERVAL boundary -- used to score Oracle/Causal/Adaptive Legacy/No
+    Tilt/DRL's own per-interval logging, all against the same pooled
+    snapshot. (DRL's own reward/state accumulation, against its own
+    per-sector staggered window rather than this shared boundary, is
+    SpatialGridEstimator's job -- see helpers/spatial_grid_estimator.py --
+    not this class's.)
 
     :param kpi_manager: resolves power at a given tilt; this class never
         mutates sector_etilts directly.
@@ -381,18 +411,12 @@ class IntervalMeasurementPool:
         self.num_sectors = num_sectors
         self.start_interval()
 
-        self._window_served = np.zeros(num_sectors)
-        self._window_covered = np.zeros(num_sectors)
-        self._window_neighbor_served = np.zeros(num_sectors)
-        self._window_overshoot_hits = np.zeros(num_sectors)
-        self._window_last_coverage = np.full(num_sectors, np.nan)
-        self._window_last_overshoot = np.full(num_sectors, np.nan)
-
     # ------------------------------------------------------- interval pool
 
     def start_interval(self):
         """Reset accumulators for a new tilt-control interval -- no
         retention beyond the interval currently being pooled."""
+        logger.function("IntervalMeasurementPool.start_interval")
         self._table_chunks = []
         self._adaptive_r0_chunks = []
         self._drl_r0_chunks = []
@@ -420,6 +444,7 @@ class IntervalMeasurementPool:
             for a per-sector rolling-window accumulator) without resolving
             the same power a second time.
         """
+        logger.function("pool_measurement start: needs_sweep=%s", needs_sweep)
         if needs_sweep:
             self._table_chunks.append(self.kpi_manager.compute_tilt_sector_ue_rx_power(state, downtilt_sweep_deg))
 
@@ -434,53 +459,21 @@ class IntervalMeasurementPool:
         no_tilt_power_w = self.kpi_manager.resolve_power_at_tilt(state, np.zeros(self.num_sectors))
         self._no_tilt_chunks.append(no_tilt_power_w)
 
+        logger.function("pool_measurement end")
         return drl_power_w[0]
 
     def pooled_interval(self) -> dict:
         """Concatenates this interval's accumulated measurement draws into
         the pooled result. Call start_interval() again before the next one.
         """
-        return {
+        logger.function("pooled_interval start")
+        pooled = {
             "power_table": np.concatenate(self._table_chunks, axis=1) if self._table_chunks else None,
             "adaptive_power_w_r0": np.concatenate(self._adaptive_r0_chunks, axis=1),
             "drl_power_w_r0": np.concatenate(self._drl_r0_chunks, axis=1),
             "no_tilt_power_w": np.concatenate(self._no_tilt_chunks, axis=0),
             "ut_loc_r0": np.concatenate(self._ut_loc_r0_chunks, axis=0),
         }
-
-    # ------------------------------------------------- sector window pool
-
-    def accumulate_sector_window(self, kpis: dict) -> None:
-        """One real slot's contribution to the per-sector staggered-window
-        coverage/overshoot accumulator -- from
-        compute_ue_kpis(..., return_counts=True).
-        """
-        self._window_served += kpis["per_sector_served_count"]
-        self._window_covered += kpis["per_sector_covered_count"]
-        self._window_neighbor_served += kpis["neighbor_served_count"]
-        self._window_overshoot_hits += kpis["overshoot_hit_count"]
-
-    def resolve_sector_window(self, closes: np.ndarray) -> tuple:
-        """:param closes: [num_sectors] bool, which sectors' windows just closed.
-        :output: (coverage_per_sector, overshoot_per_sector) [num_sectors]
-            each -- updates `closes` rows from this window's accumulated
-            counts (NaN if that sector served no one this window) and
-            resets them for the next window; non-`closes` rows keep their
-            previous value.
-        """
-        with np.errstate(invalid="ignore"):
-            coverage_now = np.where(self._window_served > 0,
-                                    self._window_covered / np.where(self._window_served > 0, self._window_served, 1),
-                                    np.nan)
-            overshoot_now = np.where(self._window_neighbor_served > 0,
-                                     self._window_overshoot_hits / np.where(
-                                         self._window_neighbor_served > 0, self._window_neighbor_served, 1),
-                                     np.nan)
-        self._window_last_coverage[closes] = coverage_now[closes]
-        self._window_last_overshoot[closes] = overshoot_now[closes]
-
-        self._window_served[closes] = 0.0
-        self._window_covered[closes] = 0.0
-        self._window_neighbor_served[closes] = 0.0
-        self._window_overshoot_hits[closes] = 0.0
-        return self._window_last_coverage, self._window_last_overshoot
+        logger.debug("pooled_interval: drl_power_w_r0 shape=%s", pooled["drl_power_w_r0"].shape)
+        logger.function("pooled_interval end")
+        return pooled

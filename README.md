@@ -4,8 +4,8 @@ This repository implements and compares controllers for Remote Electrical Tilt (
 optimization in a simulated cellular network. Each controller observes per-sector KPI
 feedback (coverage, SINR, overshoot) and adjusts the electrical downtilt of each sector,
 closed-loop, to improve network coverage as UEs move. The comparison spans a non-causal
-upper bound, a causal version of the same search, a legacy rule-based controller, a fixed
-baseline, and a reinforcement-learning controller.
+local-search benchmark, a causal version of the same search, a legacy rule-based controller,
+a fixed baseline, and a reinforcement-learning controller.
 
 ## Environment Setup
 
@@ -110,8 +110,10 @@ whole nested dictionary into `SimulationEngine`.
 **Dynamic Local Oracle** (`helpers/tilt_controller.py`: `DynamicTiltController` +
 `LocalTiltSelector`) — per-sector coordinate ascent over the candidate downtilt values,
 warm-started from the previous interval's assignment, decided and scored on the same
-interval's pooled measurements. Non-causal: it establishes an upper bound on what the
-search could achieve if it could see the future.
+interval's pooled measurements. Non-causal: it's a strong local-search benchmark for what
+the search could achieve if it could see the future -- coordinate ascent finds a local
+optimum, not a proven joint-global one, so it is not a guaranteed upper bound (a small
+exhaustive-search counterexample can miss a jointly better assignment).
 
 **Dynamic Local Causal** (same classes) — the identical search, but decided one interval
 ahead of when it is scored. Each interval scores the assignment chosen from the previous

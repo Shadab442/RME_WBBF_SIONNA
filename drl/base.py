@@ -12,7 +12,7 @@ class TiltPolicy(ABC):
 
     :ivar step_losses: training loss per learning step (whatever units the
         concrete policy learns in -- e.g. one appended value per sector per
-        interval for IndependentDqn); empty for policies that don't learn
+        interval for Dqn); empty for policies that don't learn
         (e.g. RandomPolicy).
     """
 

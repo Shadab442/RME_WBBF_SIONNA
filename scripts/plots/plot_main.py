@@ -42,7 +42,7 @@ MOVING_AVERAGE_WINDOW = 11
 
 # Which methods to draw on coverage_vs_time.png -- edit and rerun, no need
 # to redo the simulation (all 5 are always saved to data.npz).
-SHOW_METHODS = ["no_tilt", "drl", "adaptive_legacy", "dynamic_local_causal", "dynamic_local_oracle"]
+SHOW_METHODS = ["no_tilt", "drl", "adaptive_legacy", "dynamic_local_oracle"]  # causal skipped by default (run_causal: false)
 
 data = np.load(os.path.join(OUT_DIR, "data.npz"))
 
@@ -278,35 +278,40 @@ print(
 )
 
 # ---------------- spatial/temporal variability summary stats ---------------
+def changes_per_sector(history):
+    """Per-sector count of real (nonzero, finite-to-finite) tilt changes.
+    A disabled baseline's history is all-NaN (e.g. Causal when run_causal
+    is off) -- np.diff of NaNs is NaN, and count_nonzero treats NaN as
+    "changed", so a controller that never ran would otherwise appear to
+    change every single interval. Report those sectors as NaN instead.
+    """
+    diffs = np.diff(history, axis=0)
+    valid = np.isfinite(diffs)
+    counts = np.count_nonzero(valid & (diffs != 0), axis=0).astype(float)
+    counts[~valid.any(axis=0)] = np.nan
+    return counts
+
+
+def print_variability(name, changes):
+    if np.isnan(changes).all():
+        print(f"Temporal variability ({name}): unavailable (baseline did not run)")
+        return
+    print(
+        f"Temporal variability ({name}): tilt changes per sector over {NUM_TILT_CONTROL_INTERVALS - 1} "
+        f"interval transitions -- min={np.nanmin(changes)}, max={np.nanmax(changes)}, "
+        f"mean={np.nanmean(changes):.1f}"
+    )
+
+
 distinct_tilts_per_interval = np.array([
     len(set(DYNAMIC_LOCAL_ORACLE_TILT_DEG_HISTORY[interval].tolist())) for interval in range(NUM_TILT_CONTROL_INTERVALS)
 ])
-oracle_changes_per_sector = np.count_nonzero(np.diff(DYNAMIC_LOCAL_ORACLE_TILT_DEG_HISTORY, axis=0), axis=0)
-causal_changes_per_sector = np.count_nonzero(np.diff(DYNAMIC_LOCAL_CAUSAL_TILT_DEG_HISTORY, axis=0), axis=0)
-adaptive_legacy_changes_per_sector = np.count_nonzero(np.diff(ADAPTIVE_LEGACY_TILT_DEG_HISTORY, axis=0), axis=0)
-drl_changes_per_sector = np.count_nonzero(np.diff(DRL_TILT_DEG_HISTORY, axis=0), axis=0)
 print(
     f"Spatial variability: {distinct_tilts_per_interval.mean():.1f} distinct tilts/interval on average "
     f"(out of {len(DOWNTILT_SWEEP_DEG)} candidates, {NUM_BS} sectors)"
 )
-print(
-    f"Temporal variability (Oracle): tilt changes per sector over {NUM_TILT_CONTROL_INTERVALS - 1} interval transitions -- "
-    f"min={oracle_changes_per_sector.min()}, max={oracle_changes_per_sector.max()}, "
-    f"mean={oracle_changes_per_sector.mean():.1f}"
-)
-print(
-    f"Temporal variability (Causal): tilt changes per sector over {NUM_TILT_CONTROL_INTERVALS - 1} interval transitions -- "
-    f"min={causal_changes_per_sector.min()}, max={causal_changes_per_sector.max()}, "
-    f"mean={causal_changes_per_sector.mean():.1f}"
-)
-print(
-    f"Temporal variability (Adaptive Legacy): tilt changes per sector over {NUM_TILT_CONTROL_INTERVALS - 1} interval transitions -- "
-    f"min={adaptive_legacy_changes_per_sector.min()}, max={adaptive_legacy_changes_per_sector.max()}, "
-    f"mean={adaptive_legacy_changes_per_sector.mean():.1f}"
-)
-print(
-    f"Temporal variability (DRL): tilt changes per sector over {NUM_TILT_CONTROL_INTERVALS - 1} interval transitions -- "
-    f"min={drl_changes_per_sector.min()}, max={drl_changes_per_sector.max()}, "
-    f"mean={drl_changes_per_sector.mean():.1f}"
-)
+print_variability("Oracle", changes_per_sector(DYNAMIC_LOCAL_ORACLE_TILT_DEG_HISTORY))
+print_variability("Causal", changes_per_sector(DYNAMIC_LOCAL_CAUSAL_TILT_DEG_HISTORY))
+print_variability("Adaptive Legacy", changes_per_sector(ADAPTIVE_LEGACY_TILT_DEG_HISTORY))
+print_variability("DRL", changes_per_sector(DRL_TILT_DEG_HISTORY))
 print(f"No Tilt's fixed assignment: {sorted(set(NO_TILT_DEG.tolist()))} degrees (every sector)")

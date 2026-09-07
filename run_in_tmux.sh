@@ -52,8 +52,23 @@ if tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
     exit 1
 fi
 
-tmux new-session -d -s "$SESSION_NAME" \
-    "cd '$REPO_ROOT' && '$VENV_PYTHON' -u '$SCRIPT_PATH' $* 2>&1 | tee '$LOG_FILE'; echo; echo '[done -- press any key to close]'; read -n 1"
+# $* would flatten remaining args into one whitespace-joined string, losing
+# argument boundaries for any value containing a space or shell
+# metacharacter once it's re-parsed by the shell tmux spawns for this pane;
+# printf %q re-quotes each arg individually so it survives that round trip.
+QUOTED_ARGS=""
+for arg in "$@"; do
+    QUOTED_ARGS+=" $(printf '%q' "$arg")"
+done
+
+# bash -c (not the pane's default shell, which may not be bash) so
+# PIPESTATUS is available -- reports python's own exit status instead of
+# an unconditional "done" regardless of whether it actually succeeded.
+tmux new-session -d -s "$SESSION_NAME" bash -c \
+    "cd '$REPO_ROOT' && '$VENV_PYTHON' -u '$SCRIPT_PATH'$QUOTED_ARGS 2>&1 | tee '$LOG_FILE'; \
+    STATUS=\${PIPESTATUS[0]}; echo; \
+    if [ \"\$STATUS\" -eq 0 ]; then echo '[done -- exit 0 -- press any key to close]'; \
+    else echo \"[FAILED -- exit \$STATUS -- press any key to close]\"; fi; read -n 1"
 
 echo "Started: $SCRIPT_PATH"
 echo "Session: $SESSION_NAME"

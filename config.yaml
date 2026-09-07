@@ -7,7 +7,11 @@ topology:
 antenna:
   m: 8                          # vertical antenna elements per sector
   antenna_window: rectangular
-  downtilt_sweep_deg: [0, 2, 4, 6, 8]
+
+downtilt:
+  downtilt_sweep_start_deg: 0
+  downtilt_sweep_end_deg: 12
+  tilt_step_deg: 4
 
 channel:
   carrier_frequency: 3.5e+9     # Hz, n78 FR1 mid-band
@@ -20,17 +24,79 @@ kpi:
   sinr_percentiles: [50, 5]
 
 mobility:
-  mobility_model: rpgm
   min_ut_speed: 1.0             # m/s
   max_ut_speed: 2.0             # m/s
   num_groups: 60
-  deviation_radius_frac_area: 0.05
+  deviation_radius_frac_area: 0.1
+  # Hard cap on cluster radius (deviation_radius) -- enforced at construction
+  # (SimulationEngine asserts deviation_radius <= this). Keeps EVERY member
+  # of a cluster centered anywhere at least min_bs_ut_dist + cluster_radius_max_m
+  # from a site outside the exclusion zone too, not just the cluster's own
+  # reference/waypoint point -- see helpers/mobility.py's "central" waypoint
+  # filtering and helpers/ue_drop.py's cluster_centers.
+  cluster_radius_max_m: 100.0
   member_jitter_speed: 1.0      # m/s
+  # Cluster-CENTER mobility:
+  #   random   -- baseline: continuous random-waypoint walk (unbounded
+  #               destinations across the whole footprint).
+  #   periodic -- discrete hotspot transitions: holds at one of
+  #               num_waypoints predefined per-cluster hotspots (auto-
+  #               generated within one hex cell_radius of the cluster's own
+  #               starting site) for waypoint_hold_steps tilt control
+  #               intervals, then jumps cyclically (0->1->2->0->...).
+  #   markov   -- same discrete jumps, but the next waypoint is sampled
+  #               from waypoint_transition_matrix's row instead of cycling.
+  # Examples:
+  #   periodic + static UEs:      cluster_mobility_mode: periodic, intra_cluster_mobility: static
+  #   periodic + random-walk UEs: cluster_mobility_mode: periodic, intra_cluster_mobility: random_walk
+  #   markov + random-walk UEs:   cluster_mobility_mode: markov,   intra_cluster_mobility: random_walk
+  #   original random RPGM:       cluster_mobility_mode: random (waypoint_* keys unused)
+  cluster_mobility_mode: periodic   # "random" | "periodic" | "markov"
+  # transition: HOW the reference point gets from its current position to
+  # the next one, independent of cluster_mobility_mode above -- see
+  # helpers/mobility.py's class docstring.
+  #   jump   -- holds, then teleports instantly. "random" holds for a
+  #             random duration in [1, waypoint_hold_steps]; periodic/markov
+  #             hold for a fixed waypoint_hold_steps. (This class's
+  #             original periodic/markov behavior.)
+  #   smooth -- walks continuously instead of teleporting. "random" draws a
+  #             random speed in [min_ut_speed, max_ut_speed] each transition
+  #             (its original behavior) and departs again immediately on
+  #             arrival. periodic/markov instead take exactly ONE
+  #             tilt_control_interval_s per transition regardless of
+  #             distance (speed = distance / tilt_control_interval_s, not
+  #             random), and still dwell for waypoint_hold_steps at each
+  #             arrived-at waypoint first.
+  transition: smooth                  # "jump" | "smooth"
+  num_waypoints: 3                 # only used by periodic/markov
+  # In TILT CONTROL INTERVALS (3 * 300s = 15 min) -- used by periodic/markov
+  # (any transition), and by cluster_mobility_mode=random with
+  # transition=jump (there it bounds a random per-group dwell instead of
+  # being a fixed duration -- see transition's own comment above).
+  waypoint_hold_steps: 3
+  waypoint_transition_matrix:      # only used by markov; rows must sum to 1, size num_waypoints x num_waypoints
+    - [0.7, 0.2, 0.1]
+    - [0.2, 0.6, 0.2]
+    - [0.1, 0.2, 0.7]
+  # Waypoint candidate placement (periodic/markov only, ignored for "random"
+  # cluster_mobility_mode):
+  #   random  -- continuous random points within one hex cell_radius of the
+  #              cluster's own starting site.
+  #   central -- num_waypoints chosen at random (no replacement) from the
+  #              centroids of the cluster's home sector's 9 pooled
+  #              observation-window regions (center/edge/corner).
+  waypoint_type: central           # "random" | "central"
+  # Intra-cluster UE mobility:
+  #   random_walk -- baseline: small random drift from the cluster center,
+  #                  clamped to deviation_radius.
+  #   static      -- fixed relative offset from the cluster center; still
+  #                  moves WITH it (including across a periodic/markov jump).
+  intra_cluster_mobility: random_walk   # "random_walk" | "static"
 
 simulation:
   measurement_interval_s: 1.0
   tilt_control_interval_s: 300.0
-  num_tilt_control_intervals: 1000
+  num_tilt_control_intervals: 1200
   steady_state_episodes: 50
   num_realizations_per_slot: 1
   environment_seed: 1
@@ -40,71 +106,98 @@ algorithms:
   optimization:
     enabled: true
     coordinate_ascent_max_rounds: 20
+    run_causal: false # Dynamic Local Causal is skipped by default 
 
   adaptive_legacy:
     overlap_margin_db: 3.0
     edge_percentile: 95.0
-    tilt_step_deg: 2.0
     os_threshold: 0.006
     bc_threshold: 0.33
   
   drl:
-    policy_name: independent-dqn     # or "random"
+    policy_name: dqn     # or "random"
     algorithm_seed: 1
-    # state_type: top_k_neighbor (default/validated -- own tilt +
-    #     top_k_locations by real per-window TRAFFIC IMPORTANCE, each as
-    #     [grid-cell identity, coverage fraction] + per-neighbor overshoot
-    #     -- see top_k_locations below) |
-    #   predicted_top_k_neighbor (same shape, but importance/overshoot are
-    #     forecasted from history instead of read from the real just-
-    #     elapsed window -- see helpers/spatial_occupancy_estimator.py and
-    #     helpers/spatial_radio_state_estimator.py)
-    state_type: top_k_neighbor
-    # top_k_neighbor's location count -- landed on 10 after empirically
-    # checking how many grid cells are actually tilt-sensitive (see
-    # scripts/verifications/verify_tilt_sensitivity.py): at a strict
-    # >=50%-of-realizations flip-rate bar, under 1 cell/sector on average is
-    # genuinely sensitive; 10 is a deliberately generous margin above that.
-    top_k_locations: 10
-    # Grid cell size [m] for top_k_neighbor(_predicted)'s per-sector rhombus
-    # grid -- landed on UMa's shadow-fading decorrelation distance range.
+    # state_type: "region_aligned" -- own tilt + own (occupancy, coverage)
+    #     over a FIXED set of regions formed by pooling the sector's own
+    #     rhombus fine-grid into region_block_size x region_block_size
+    #     blocks (identical region count/geometry for every sector, no
+    #     search needed) + each of up to 4 SEPARATE side-sharing neighbors'
+    #     own tilt + one COARSE (whole-sector occupancy, whole-sector
+    #     coverage) pair -- see helpers/regional_info_provider.py.
+    state_type: region_aligned
+    # Block-pool size for region_aligned's own-region tiling -- must evenly
+    # divide grid_n (the rhombus fine-grid side length; see
+    # spatial_grid_cell_size_m below). num_own_regions = (grid_n /
+    # region_block_size)^2, e.g. grid_n=6, region_block_size=2 -> 9 regions.
+    region_block_size: 2
+    # region_aligned only -- how a sector with fewer than 4 neighbors is
+    # sized (only the neighbor portion varies; the own-region portion is
+    # always num_own_regions wide):
+    #   "variable" -- that sector's real width (fewer neighbor slots) -- no
+    #                 representational ambiguity between "no neighbor here"
+    #                 and "a real all-zero neighbor"/"a real neighbor at
+    #                 0 deg", but each sector's network then has its own
+    #                 input width (fine here since Dqn never shares
+    #                 parameters across sectors).
+    #   "zero"      -- neighbor portion always zero-filled up to 4 slots.
+    state_padding: variable
+    # Grid cell size [m] for the per-sector rhombus grid -- feeds
+    # region_aligned's block pooling and the "central" waypoint mode's
+    # region centroids -- landed on UMa's shadow-fading decorrelation
+    # distance range.
     spatial_grid_cell_size_m: 50.0
-    # reward_type: hard (only option -- per-sector coverage/overshoot)
-    reward_type: hard
-    reward_lambda_coverage: 1.0
-    reward_lambda_overshoot: 0.005
-    # Decentralized setup -> assume async per-sector updates
-    async_schedule: round_robin      # "round_robin" | "random" | "sync"
-    async_group_size: 1              # sectors given a new decision per interval
+    # EMA smoothing weight on each window's new occupancy observation (in
+    # (0, 1]) -- rho_x[k] = alpha*rho_tilde_x[k] + (1-alpha)*rho_x[k-1].
+    # Starting point, not yet empirically tuned.
+    occupancy_ema_alpha: 0.5
+    # coverage_fill: how a region's coverage is computed at the fine
+    # (spatial_grid_cell_size_m) grid cells within it that had no UE this
+    # window.
+    #   zero   -- 0.0 (validated design, see helpers/regional_info_provider.py).
+    #   kriged -- Krige each sector's own RSRP [dB] map (algorithm/kriging.py),
+    #             reconstruct SINR from ALL sectors' predictions, threshold
+    #             -- SpatialGridEstimator's rsrp_per_sector method, reused
+    #             here and aggregated per region.
+    coverage_fill: kriged
+    # reward_type: "sector_neighbors" -- mean coverage pooled over the
+    #     sector's own FULL area plus its (2-4) side-sharing neighbors'
+    #     FULL areas (not just their boundary-adjacent cells) -- see
+    #     helpers/regional_info_provider.py.
+    reward_type: sector_neighbors
+    # Decentralized setup -> async per-sector updates. "async" colors
+    # sector_adjacency (Welsh-Powell) so two ADJACENT sectors never decide
+    # in the same window -- the actual requirement, not "every sector gets
+    # a unique offset". "sync": every sector decides together (offset 0).
+    async_schedule: async            # "async" | "sync"
 
     dqn:
-      # model: mlp | wesn -- plain MLP wasn't learning well (flat/noisy
-      # reward, see drl/common.py's Mlp); wesn (Windowed Echo State Network,
-      # algorithm/wesn.py) gives the Q-network short-term memory across a
-      # sector's own recent decisions via a fixed random reservoir + one
-      # trained linear readout. Now the default.
+      # model: mlp | wesn
       model: wesn
-      hidden_sizes: [32]         # mlp only
-      # wesn only -- window length, in this sector's OWN past decisions
-      # (not raw slots), fed through the reservoir each act()/learn() call.
-      # Not yet empirically tuned for this problem.
-      sequence_length: 8
+       # mlp only 
+      hidden_sizes: [128, 32]   
+      # wesn only
+      sequence_length: 16
       wesn:
-        units: 32
+        units: 128
         connectivity: 0.5
         spectral_radius: 0.9
         leaky: 1.0
-        win_len: 4              # <= sequence_length
-      learning_rate: 5.0e-4
+        win_len: 16               # <= sequence_length
+        # Readout architecture -- 
+        # [] (no MLP, single Linear) | [h1] (1 hidden layer) 
+        # [h1, h2] (2 hidden layers), any depth Mlp itself supports. 
+        # mlp_position ("early" | "late") only matters when it is non-empty
+        mlp_hidden_sizes: []
+        mlp_position: early
+      learning_rate: 2.5e-4
       gamma: 0.95
       batch_size: 32
       replay_capacity: 10000
-      warmup_steps: 32
       train_steps_per_interval: 1
-      target_update_steps: 30
+      target_update_steps: 50
       epsilon_start: 1.0
       epsilon_end: 0.01
-      epsilon_decay_rate: 0.995
+      epsilon_decay_rate: 0.996
   
 test_tilt_window_calibration:
   candidate_window_slots: [1, 10]
