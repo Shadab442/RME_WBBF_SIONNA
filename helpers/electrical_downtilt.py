@@ -10,8 +10,7 @@ from typing import Union
 import torch
 
 from sionna.phy import PI, SPEED_OF_LIGHT
-# Re-exported for convenience -- a single antenna import surface for this repo.
-from sionna.phy.channel.tr38901 import AntennaElement, PanelArray, Antenna, AntennaArray
+from sionna.phy.channel.tr38901 import PanelArray, Antenna, AntennaArray
 from helpers.utils import get_logger
 
 logger = get_logger(__name__)

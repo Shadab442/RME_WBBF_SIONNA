@@ -5,12 +5,7 @@ a length-T window of raw input, then read out by a GRADIENT-TRAINED
 ("recent", the WESN skip connection that bypasses the reservoir)].
 "Windowed" because every call starts the reservoir from a zero state and
 rolls it forward T steps -- nothing is carried between calls, unlike a
-stateful RNN. Used by the DRL policy's own Q-network (drl/dqn.py) --
-see algorithm/one_shot_wesn.py for the STATEFUL, closed-form-readout
-sibling used by the offline occupancy predictor
-(scripts/train_occupancy_predictor.py); the two are deliberately separate
-classes, not a shared base, since statefulness changes what "one call"
-means in ways that would need real scrutiny before touching the DQN path.
+stateful RNN. Used by the DRL policy's own Q-network (drl/dqn.py).
 
 H. Jaeger, "The 'echo state' approach to analysing and training
 recurrent neural networks", GMD Report 148, German National Research

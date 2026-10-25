@@ -1,31 +1,24 @@
-"""Per-sector spatial grid accumulator for the local RL state/reward
-(RME-WBBF RL Problem Formulation, slide 8): for every cell in a sector's
-own observation region X_s, tracks smoothed occupancy rho_x and coverage
-c_x (Kriged where unvisited). The same per-cell (visit, covered) counts
-this window also directly give the sector's own local reward -- aggregate
-over its own cells, no separate accumulator needed.
-
-Replaces the old top-K-ranking estimator pair (spatial_occupancy_estimator.py
-/ spatial_radio_state_estimator.py): there's no more ranking/selection step
-now that every cell is reported, so one class covers what used to need two.
+"""Per-sector spatial grid accumulator for the local RL state/reward: 
+for every cell in a sector's own observation region X_s, 
+tracks smoothed occupancy rho_x and coverage c_x (Kriged where unvisited). 
+The same per-cell (visit, covered) counts this window also directly give the 
+sector's own local reward -- aggregate over its own cells, no separate accumulator needed.
 
 Two interchangeable radio_map_method options for filling in coverage at
-UNVISITED cells (config-selected, meant to be compared empirically rather
-than assumed -- see project memory):
+UNVISITED cells:
   "sinr_direct"      -- Krige the observed SINR [dB] directly (a continuous
                         physical quantity, unlike a bounded coverage
                         fraction), then threshold the prediction.
   "rsrp_per_sector"  -- Krige each of the num_bs sectors' own RSRP [dB] map
                         separately, then reconstruct SINR from ALL sectors'
-                        predictions (not a neighbor-limited subset -- an
-                        empirical check found even a 10-neighbor halo
-                        captures only ~56% of true interference on average
-                        for this topology, so limiting the reconstruction
-                        would silently reintroduce that bias).
+                        predictions.
 """
+
+import math
 
 import numpy as np
 
+from algorithm.cgr import CGRRadioMapEstimator
 from algorithm.kriging import OrdinaryKriging
 from helpers.utils import get_logger
 
@@ -34,23 +27,27 @@ logger = get_logger(__name__)
 
 class SpatialGridEstimator:
     """
-    :ivar visit_count: [num_bs, num_grid_cells] running UE-occupancy count
-        this window (reset to 0 for a sector once its window closes).
-    :ivar covered_count: [num_bs, num_grid_cells] running covered-UE count
-        this window, same reset.
-    :ivar occupancy_ema: [num_bs, num_grid_cells] persistent smoothed
-        occupancy share -- rho_x[k] = alpha*rho_tilde_x[k] + (1-alpha)*rho_x[k-1],
-        never reset (only updated) across windows.
+    :ivar visit_count: [num_bs, num_grid_cells] this turn's UE-occupancy
+        count -- always reset to 0 for every sector at the end of every
+        compute() call (exactly one measurement is taken per turn; see
+        helpers/regional_info_provider.py's module docstring for what a
+        "turn" is under sync vs async scheduling).
+    :ivar covered_count: [num_bs, num_grid_cells] this turn's covered-UE
+        count, same reset.
     """
 
     def __init__(self, num_bs: int, num_grid_cells: int, grid_points: np.ndarray,
                 length_scale: float, coverage_threshold_db: float,
                 radio_map_method: str = "sinr_direct", noise_power_w: float = None,
-                occupancy_ema_alpha: float = 0.8, variance: float = 1.0):
+                variance: float = 1.0,
+                topology=None, radio_map_estimator: str = "kriging",
+                cgr_num_gaussian: int = 12, cgr_ridge_lambda: float = 1e-4,
+                cgr_gaussian_config: dict = None, cgr_baseline_method: str = "global_mean",
+                cgr_baseline_length_scale_m: float = 50.0):
         """
         :param grid_points: [num_bs, num_grid_cells, 2] fixed world (x, y)
             cell centers, from CellularTopology.build_sector_rhombus_grid --
-            Kriging's target/known coordinates.
+            Kriging's/CGR's target/known coordinates.
         :param length_scale, variance: OrdinaryKriging's RBF covariance
             parameters for filling in coverage at unvisited cells.
         :param coverage_threshold_db: SINR threshold -- both methods Krige a
@@ -60,14 +57,28 @@ class SpatialGridEstimator:
             module docstring.
         :param noise_power_w: required for "rsrp_per_sector" (SINR
             reconstruction needs the same noise floor KpiManager uses).
-        :param occupancy_ema_alpha: EMA weight on this window's new
-            occupancy observation, in (0, 1] -- 1.0 reduces to no smoothing
-            ("use this window's value as-is").
+        :param topology: a CellularTopology -- required when
+            radio_map_estimator="cgr" (for each sector's own bs_loc/
+            azimuth); unused for "kriging".
+        :param radio_map_estimator: "kriging" (default, existing baseline,
+            always available) or "cgr" (algorithm/cgr.py's
+            CGRRadioMapEstimator, ONLY used inside the rsrp_per_sector
+            branch's per-transmitting-sector prediction -- sinr_direct
+            always uses Kriging, since there's no single sector to
+            attribute an already-combined SINR field to).
+        :param cgr_num_gaussian, cgr_ridge_lambda, cgr_gaussian_config,
+            cgr_baseline_method, cgr_baseline_length_scale_m:
+            CGRRadioMapEstimator hyperparameters, used only when
+            radio_map_estimator="cgr" -- see its own __init__ docstring.
         """
         assert radio_map_method in ("sinr_direct", "rsrp_per_sector"), \
             "radio_map_method must be 'sinr_direct' or 'rsrp_per_sector'"
         assert radio_map_method != "rsrp_per_sector" or noise_power_w is not None, \
             "rsrp_per_sector needs noise_power_w to reconstruct SINR"
+        assert radio_map_estimator in ("kriging", "cgr"), \
+            "radio_map_estimator must be 'kriging' or 'cgr'"
+        assert radio_map_estimator != "cgr" or topology is not None, \
+            "radio_map_estimator='cgr' needs topology (for bs_loc/bs_orientations)"
 
         self.num_bs = num_bs
         self.num_grid_cells = num_grid_cells
@@ -75,27 +86,37 @@ class SpatialGridEstimator:
         self.coverage_threshold_db = coverage_threshold_db
         self.radio_map_method = radio_map_method
         self.noise_power_w = noise_power_w
-        self.occupancy_ema_alpha = occupancy_ema_alpha
+        self.radio_map_estimator = radio_map_estimator
+        # Cells within min_bs_ut_dist of ANY site are never estimated
+        # (Kriging or CGR) -- a real UE can never be dropped there (see
+        # helpers/ue_drop.py's own min_dist_from_site enforcement), so
+        # they're NEVER visited and Krige/CGR would be extrapolating a
+        # value for a location no measurement will ever exist for. Left
+        # at the same -1 "not yet estimated" sentinel `compute()` already
+        # uses, not force-computed. Defaults to "every cell estimable"
+        # when topology isn't given (kriging-only callers that don't care
+        # about this refinement, e.g. tests) -- no behavior change for them.
+        if topology is not None:
+            site_loc = topology.site_loc.detach().cpu().numpy()  # [num_cells, 2]
+            dist_to_nearest_site = np.linalg.norm(
+                grid_points[:, :, None, :] - site_loc[None, None, :, :], axis=-1).min(axis=-1)
+            self.estimable_cell_mask = dist_to_nearest_site >= float(topology.min_bs_ut_dist)
+        else:
+            self.estimable_cell_mask = np.ones((num_bs, num_grid_cells), dtype=bool)
+        # Kriging stays available as a baseline regardless of
+        # radio_map_estimator -- see module/class docstring.
         self.kriging = OrdinaryKriging(length_scale, variance)
+        if radio_map_estimator == "cgr":
+            self.bs_loc = topology.bs_loc[0, :, :].detach().cpu().numpy()  # [num_bs, 3]
+            self.bs_azimuths_rad = topology.bs_orientations[0, :, 0].detach().cpu().numpy()  # [num_bs]
+            self.cgr = CGRRadioMapEstimator(num_gaussian=cgr_num_gaussian, ridge_lambda=cgr_ridge_lambda,
+                                           gaussian_config=cgr_gaussian_config,
+                                           baseline_method=cgr_baseline_method,
+                                           baseline_length_scale_m=cgr_baseline_length_scale_m)
 
         self.visit_count = np.zeros((num_bs, num_grid_cells))
         self.covered_count = np.zeros((num_bs, num_grid_cells))
-        self.occupancy_ema = np.zeros((num_bs, num_grid_cells))
-        self._occupancy_initialized = np.zeros(num_bs, dtype=bool)
 
-        # Network-wide visit total is tracked as a running cumulative sum,
-        # NOT a fixed-length rolling window -- a sector's own visit_count
-        # numerator covers "since its last reset" (or since t=0, for its
-        # FIRST-ever window, which under async staggering is longer than a
-        # steady-state window by its own phase offset). Snapshotting the
-        # cumulative total at each sector's own last reset and diffing
-        # against the current total reproduces exactly the same span as
-        # that sector's own numerator, at startup and in steady state alike
-        # -- a fixed K-slot window (see git history) gets this right in
-        # steady state but silently under-counts the denominator on a
-        # sector's first-ever (longer than K) window.
-        self._cumulative_visits = 0.0
-        self._last_reset_cumulative = np.zeros(num_bs)
         if radio_map_method == "sinr_direct":
             self.sinr_db_sum = np.zeros((num_bs, num_grid_cells))
         else:
@@ -125,7 +146,6 @@ class SpatialGridEstimator:
             "rsrp_per_sector needs power_db_all_sectors"
 
         resolved = (sector_idx >= 0) & (cell_idx >= 0) & (cell_idx < self.num_grid_cells)
-        self._cumulative_visits += float(resolved.sum())
         np.add.at(self.visit_count, (sector_idx[resolved], cell_idx[resolved]), 1.0)
         np.add.at(self.covered_count, (sector_idx[resolved], cell_idx[resolved]),
                   covered_ue[resolved].astype(float))
@@ -138,44 +158,153 @@ class SpatialGridEstimator:
         logger.debug("SpatialGridEstimator.accumulate: resolved=%d/%d", int(resolved.sum()), resolved.size)
         logger.function("SpatialGridEstimator.accumulate end")
 
-    def compute(self, closes: np.ndarray) -> tuple:
-        """Resolves the just-elapsed window for every sector in `closes`:
-        smoothed per-cell occupancy, per-cell coverage (Kriged where
-        unvisited), and each sector's own local reward (this window's
-        coverage aggregated over its own cells). Resets window counters for
-        closing sectors; occupancy_ema persists (it's a running estimate,
-        not a per-window quantity).
+    def _cgr_context(self, b: int, i: int, own_tilt_deg: float) -> dict:
+        """Builds algorithm/cgr.py's context dict for predicting
+        transmitting sector b's own RSRP field over geographic sector i's
+        grid -- own geometry only (see CGRRadioMapEstimator.
+        _initialize_gaussians's own docstring for why neighboring tilts
+        are never needed here).
 
+        :param own_tilt_deg: sector b's OWN current electrical downtilt [deg].
+        """
+        cell_min = self.grid_points[i].min(axis=0)
+        cell_max = self.grid_points[i].max(axis=0)
+        receiver_height = 1.5
+        return {
+            "tx_position": self.bs_loc[b].tolist(),
+            "own_azimuth_deg": math.degrees(float(self.bs_azimuths_rad[b])),
+            "own_tilt_deg": float(own_tilt_deg),
+            "receiver_height": receiver_height,
+            # Tight bounding box of geo-sector i's own FULL grid (known
+            # ahead of time, not just the measured points) -- z-row set
+            # tight around receiver_height, since every known/target point
+            # CGRRadioMapEstimator builds sits on that one height plane.
+            "env_dims": [[float(cell_min[0]), float(cell_max[0])],
+                        [float(cell_min[1]), float(cell_max[1])],
+                        [receiver_height - 1.0, receiver_height + 1.0]],
+        }
+
+    def infer_region_probabilities(self, ue_sector: np.ndarray, ue_measured_rsrp_db: np.ndarray,
+                                   cell_to_region: np.ndarray, num_regions: int,
+                                   sigma_db: float, radio_map_estimator: str = "kriging",
+                                   current_tilts_deg: np.ndarray = None) -> np.ndarray:
+        """Region-membership probabilities for UEs whose exact location
+        isn't known (non-anchor UEs -- see SimulationEngine.
+        location_reporting_mask) -- inferred by comparing each UE's own
+        measured RSRP AT its serving sector against THIS TURN's anchor-fit
+        RSRP field (Kriging or CGR) over that sector's own fine grid, never
+        the UE's real position (which is exactly what's unknown here).
+
+        Must be called AFTER accumulate() for this turn (uses this turn's
+        own self.visit_count/self.rsrp_db_sum -- the SAME known-point data
+        compute()'s own coverage-filling uses) and BEFORE it's reset.
+
+        :param ue_sector: [num_ue] int -- each UE's own geographic/serving
+            sector (CellularTopology.assign_to_sector_rhombus_grid's own
+            sector_idx). This IS known even for a non-reporting UE --
+            which sector serves a UE is ordinary connectivity, not the
+            precise position that's actually unknown.
+        :param ue_measured_rsrp_db: [num_ue] float -- each UE's own real
+            measured RSRP at its serving sector -- never used to reveal
+            WHERE in that sector, only compared against the field.
+        :param cell_to_region: [num_grid_cells] int -- which of
+            num_regions each fine cell belongs to (OccupancyEstimator.
+            cell_to_region / RegionalInfoProvider.cell_to_region).
+        :param sigma_db: Gaussian-kernel bandwidth for the measured-vs-
+            predicted match -- calibrate empirically against this
+            scenario's own actual Kriging/CGR residual scale, not guessed.
+        :param radio_map_estimator: "kriging" (default -- production's own
+            choice, a self-contained fit needing no extra context) or
+            "cgr" (this instance's own self.cgr -- only for debug/
+            validation tooling, e.g. scripts/debug_pipeline_audit.py's
+            phase 5, comparing both estimators' own region-inference
+            quality; requires current_tilts_deg).
+        :param current_tilts_deg: [num_bs] -- required (asserted) only for
+            radio_map_estimator="cgr" (CGR's own tilt-aware Gaussian
+            placement needs the transmitting sector's current tilt).
+        :output: [num_ue, num_regions], each row summing to 1 -- uniform
+            for a UE whose own sector got fewer than 2 anchor points this
+            turn (nothing to fit from yet).
+        """
+        assert radio_map_estimator != "cgr" or current_tilts_deg is not None, \
+            "radio_map_estimator='cgr' needs current_tilts_deg"
+        num_ue = len(ue_sector)
+        probs = np.full((num_ue, num_regions), 1.0 / num_regions)
+        for s in np.unique(ue_sector):
+            known = self.visit_count[s] > 0
+            if known.sum() < 2:
+                continue
+            known_xy = self.grid_points[s, known]
+            known_values = self.rsrp_db_sum[s, s, known] / self.visit_count[s, known]
+            target_cells = np.where(self.estimable_cell_mask[s])[0]
+            if radio_map_estimator == "cgr":
+                context = self._cgr_context(s, s, current_tilts_deg[s])
+                predicted = self.cgr.predict(known_xy, known_values, self.grid_points[s, target_cells],
+                                             context=context)
+            else:
+                predicted = self.kriging.predict(known_xy, known_values, self.grid_points[s, target_cells])
+
+            ue_mask = ue_sector == s
+            measured = ue_measured_rsrp_db[ue_mask][:, None]  # [n_ue_s, 1]
+            likelihood = np.exp(-((measured - predicted[None, :]) ** 2) / (2.0 * sigma_db ** 2))
+            total = likelihood.sum(axis=1, keepdims=True)
+            cell_probs = np.where(total > 0, likelihood / np.where(total > 0, total, 1.0),
+                                  1.0 / target_cells.size)
+
+            region_of_target = cell_to_region[target_cells]
+            region_probs = np.zeros((int(ue_mask.sum()), num_regions))
+            for r in range(num_regions):
+                region_probs[:, r] = cell_probs[:, region_of_target == r].sum(axis=1)
+            probs[ue_mask] = region_probs
+        return probs
+
+    def reset(self) -> None:
+        """Clears this turn's accumulated (visit, covered, RSRP/SINR sum)
+        state with NO prediction math -- for a caller that only ever needs
+        infer_region_probabilities' Kriging fit (never compute()'s own
+        per-cell coverage prediction, e.g. SimulationEngine's production
+        instance since 2026-09-20 -- see RegionalInfoProvider's own module
+        docstring), so it isn't stuck paying compute()'s full Kriging/CGR
+        coverage-prediction cost every interval just to reset for the next
+        one. compute() and predict_full_rsrp_sinr are unaffected -- e.g.
+        scripts/debug_pipeline_audit.py's own standalone Kriging/CGR
+        validation still uses those directly.
+        """
+        self.visit_count[:] = 0.0
+        self.covered_count[:] = 0.0
+        if self.radio_map_method == "sinr_direct":
+            self.sinr_db_sum[:] = 0.0
+        else:
+            self.rsrp_db_sum[:] = 0.0
+
+    def compute(self, closes: np.ndarray, current_tilts_deg: np.ndarray = None) -> tuple:
+        """Resolves the just-accumulated turn: this turn's raw instantaneous
+        per-cell occupancy (no smoothing across turns -- EMA removed
+        2026-09-20, see helpers/regional_info_provider.py's module
+        docstring for why; this return value is unused by every current
+        caller anyway, see the `_` discard at both call sites), per-cell
+        coverage (Kriged/CGR-filled where unvisited), and each sector's own
+        local reward. Only `closes` sectors' reward persists (see
+        helpers/regional_info_provider.py's module docstring for what a
+        "turn"/`closes` means); raw per-turn counters always reset.
+
+        :param current_tilts_deg: [num_bs] this turn's live electrical
+            downtilt per sector [deg] -- required (asserted) only when
+            radio_map_estimator="cgr" (rsrp_per_sector's tilt-aware
+            Gaussian placement needs each transmitting sector's OWN
+            current tilt); ignored otherwise.
         :output: (occupancy [num_bs, num_grid_cells], coverage
             [num_bs, num_grid_cells], reward [num_bs] -- NaN for a sector
-            with zero visits this window, i.e. no local UEs to score).
+            with zero visits this turn, i.e. no local UEs to score).
         """
         logger.function("SpatialGridEstimator.compute start: closes=%d", int(closes.sum()))
+        assert self.radio_map_estimator != "cgr" or current_tilts_deg is not None, \
+            "radio_map_estimator='cgr' needs current_tilts_deg"
 
-        # rho_tilde_x[k] = this window's occupancy SHARE OF THE WHOLE
-        # NETWORK's visits over exactly the SAME span as this sector's own
-        # visit_count numerator -- NOT self.visit_count.sum() (mixes a
-        # closing sector's full window with others' live partial ones under
-        # async staggering) and NOT a fixed K-slot rolling total either (a
-        # sector's own FIRST-ever window, before it has closed once, spans
-        # "since t=0" -- offset+K slots, longer than K -- so a fixed-K
-        # denominator would under-count it). Diffing the running cumulative
-        # total against the snapshot taken at this sector's own last reset
-        # reproduces the exact span its numerator covers, at startup and in
-        # steady state alike.
-        total_visits_network = self._cumulative_visits - self._last_reset_cumulative  # [num_bs]
-        denom = np.where(total_visits_network > 0, total_visits_network, 1.0)
-        occupancy_tilde = np.where(total_visits_network[:, None] > 0,
-                                   self.visit_count / denom[:, None], 0.0)
-
-        first_observation = closes & ~self._occupancy_initialized
-        smoothed = closes & self._occupancy_initialized
-        self.occupancy_ema[first_observation] = occupancy_tilde[first_observation]
-        self.occupancy_ema[smoothed] = (
-            self.occupancy_ema_alpha * occupancy_tilde[smoothed]
-            + (1.0 - self.occupancy_ema_alpha) * self.occupancy_ema[smoothed]
-        )
-        self._occupancy_initialized[closes] = True
+        # This turn's occupancy share of network-wide visits, raw.
+        total_visits_network = float(self.visit_count.sum())
+        denom = total_visits_network if total_visits_network > 0 else 1.0
+        occupancy = self.visit_count / denom
 
         # c_x[k]: instantaneous coverage where visited (a real empirical
         # observation either way); where unvisited, Krige a continuous
@@ -190,7 +319,11 @@ class SpatialGridEstimator:
                 logger.warning("SpatialGridEstimator.compute: sector=%d has zero visits this window "
                               "-- coverage left at -1 for every cell", i)
                 continue
-            unknown = ~known
+            # Only cells a real UE could actually occupy get Kriged/CGR-
+            # predicted -- cells inside min_bs_ut_dist of every site stay
+            # at coverage_instant's own -1 sentinel (see
+            # self.estimable_cell_mask's own docstring above).
+            unknown = ~known & self.estimable_cell_mask[i]
             if not unknown.any():
                 continue
             if self.radio_map_method == "sinr_direct":
@@ -202,8 +335,13 @@ class SpatialGridEstimator:
                 predicted_rsrp_db = np.zeros((self.num_bs, int(unknown.sum())))
                 for b in range(self.num_bs):
                     mean_rsrp_db_b = np.where(known, self.rsrp_db_sum[b, i] / np.where(known, self.visit_count[i], 1), 0.0)
-                    predicted_rsrp_db[b] = self.kriging.predict(self.grid_points[i, known], mean_rsrp_db_b[known],
-                                                                self.grid_points[i, unknown])
+                    if self.radio_map_estimator == "cgr":
+                        context = self._cgr_context(b, i, current_tilts_deg[b])
+                        predicted_rsrp_db[b] = self.cgr.predict(self.grid_points[i, known], mean_rsrp_db_b[known],
+                                                               self.grid_points[i, unknown], context=context)
+                    else:
+                        predicted_rsrp_db[b] = self.kriging.predict(self.grid_points[i, known], mean_rsrp_db_b[known],
+                                                                    self.grid_points[i, unknown])
                 # RSRP-based attachment: the SERVER is whichever sector's
                 # predicted power is strongest at each cell, not always the
                 # geographic sector i (a neighbor can legitimately win a
@@ -222,47 +360,68 @@ class SpatialGridEstimator:
         with np.errstate(invalid="ignore"):
             reward = np.where(sector_visits > 0, self.covered_count.sum(axis=1) / np.where(sector_visits > 0, sector_visits, 1), np.nan)
 
-        self.visit_count[closes] = 0.0
-        self.covered_count[closes] = 0.0
-        self._last_reset_cumulative[closes] = self._cumulative_visits
+        self.visit_count[:] = 0.0
+        self.covered_count[:] = 0.0
         if self.radio_map_method == "sinr_direct":
-            self.sinr_db_sum[closes] = 0.0
+            self.sinr_db_sum[:] = 0.0
         else:
-            self.rsrp_db_sum[:, closes, :] = 0.0
+            self.rsrp_db_sum[:] = 0.0
         logger.debug("SpatialGridEstimator.compute: mean occupancy=%.4f mean coverage=%.4f mean reward=%.4f",
-                    float(self.occupancy_ema[closes].mean()) if closes.any() else float("nan"),
+                    float(occupancy[closes].mean()) if closes.any() else float("nan"),
                     float(np.nanmean(coverage[closes])) if closes.any() else float("nan"),
                     float(np.nanmean(reward[closes])) if closes.any() else float("nan"))
         logger.function("SpatialGridEstimator.compute end")
-        return self.occupancy_ema, coverage, reward
+        return occupancy, coverage, reward
 
+    def predict_full_rsrp_sinr(self, current_tilts_deg: np.ndarray = None) -> tuple:
+        """Continuous RSRP/SINR field at EVERY cell (known + unknown),
+        reusing compute()'s own per-sector-i prediction math -- known
+        cells get their real accumulated mean, unknown cells get the
+        Kriged/CGR prediction. Unlike compute(), this is READ-ONLY: it
+        never resets visit_count/rsrp_db_sum/sinr_db_sum, so it can be
+        called any number of times after accumulate() (e.g. once for a
+        coverage map, once for an RSRP map) without disturbing the turn's
+        own compute() call.
 
-def pool_observation_windows(occupancy_per_cell: np.ndarray, coverage_per_cell: np.ndarray,
-                             windows: list) -> tuple:
-    """Pools SpatialGridEstimator's per-cell (occupancy, coverage) into each
-    sector's 9 fixed-purpose observation windows (CellularTopology.
-    compute_observation_windows) -- NOT a partition, windows may overlap and
-    may draw cells from other sectors (halo/corner context). Per the RL
-    Problem Formulation slide's pooling formulas: occupancy is SUMMED over a
-    window's members (rho_G = sum rho_x), coverage is MEANED (c_G = mean c_x).
+        Added for scripts/debug_pipeline_audit.py's ground-truth vs.
+        anchor-only vs. RME-assisted comparison figures (2026-09-20) --
+        compute() only ever returns the thresholded binary coverage
+        decision, never the continuous field it's derived from.
 
-    :param occupancy_per_cell, coverage_per_cell: [num_bs, num_grid_cells],
-        SpatialGridEstimator.compute's outputs.
-    :param windows: [num_bs] list of dict[window_name -> list[(sector_idx, cell_idx)]].
-    :output: (occupancy_windows [num_bs, 9], coverage_windows [num_bs, 9], window_names).
-    """
-    logger.function("pool_observation_windows start")
-    num_bs = len(windows)
-    window_names = list(windows[0].keys())
-    occupancy_windows = np.zeros((num_bs, len(window_names)))
-    coverage_windows = np.zeros((num_bs, len(window_names)))
-    for i in range(num_bs):
-        for wi, wname in enumerate(window_names):
-            members = windows[i][wname]
-            sectors = [s for s, _ in members]
-            cells = [c for _, c in members]
-            occupancy_windows[i, wi] = occupancy_per_cell[sectors, cells].sum()
-            coverage_windows[i, wi] = coverage_per_cell[sectors, cells].mean()
-    logger.debug("pool_observation_windows: %d windows/sector", len(window_names))
-    logger.function("pool_observation_windows end")
-    return occupancy_windows, coverage_windows, window_names
+        :param current_tilts_deg: same as compute()'s own param -- required
+            only for radio_map_estimator="cgr".
+        :output: (rsrp_db [num_bs, num_bs, num_grid_cells] -- rsrp_db[b, i, :]
+            is sector b's own predicted RSRP over sector i's grid;
+            sinr_db [num_bs, num_grid_cells] -- each sector's own serving-cell
+            SINR, RSRP-based best-server attachment, same rule KpiManager
+            uses).
+        """
+        assert self.radio_map_estimator != "cgr" or current_tilts_deg is not None, \
+            "radio_map_estimator='cgr' needs current_tilts_deg"
+        visited = self.visit_count > 0
+        rsrp_db_full = np.zeros((self.num_bs, self.num_bs, self.num_grid_cells))
+        for i in range(self.num_bs):
+            known = visited[i]
+            unknown = ~known
+            for b in range(self.num_bs):
+                mean_rsrp_db_b = np.where(known, self.rsrp_db_sum[b, i] / np.where(known, self.visit_count[i], 1), 0.0)
+                rsrp_db_full[b, i, known] = mean_rsrp_db_b[known]
+                if not unknown.any():
+                    continue
+                if self.radio_map_estimator == "cgr":
+                    context = self._cgr_context(b, i, current_tilts_deg[b])
+                    rsrp_db_full[b, i, unknown] = self.cgr.predict(
+                        self.grid_points[i, known], mean_rsrp_db_b[known], self.grid_points[i, unknown], context=context)
+                else:
+                    rsrp_db_full[b, i, unknown] = self.kriging.predict(
+                        self.grid_points[i, known], mean_rsrp_db_b[known], self.grid_points[i, unknown])
+        rsrp_w_full = np.power(10.0, rsrp_db_full / 10.0)
+        own_rsrp_w = np.stack([rsrp_w_full[i, i] for i in range(self.num_bs)])  # [num_bs, num_grid_cells]
+        # total received power AT sector i's own grid, summed over every
+        # TRANSMITTING sector b, is rsrp_w_full[:, i, :].sum(axis=0).
+        interference_w = np.zeros((self.num_bs, self.num_grid_cells))
+        for i in range(self.num_bs):
+            total_w_i = rsrp_w_full[:, i, :].sum(axis=0)
+            interference_w[i] = total_w_i - own_rsrp_w[i]
+        sinr_db = 10.0 * np.log10(own_rsrp_w / (interference_w + self.noise_power_w))
+        return rsrp_db_full, sinr_db

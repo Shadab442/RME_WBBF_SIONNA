@@ -41,6 +41,7 @@ class CellularTopology:
         precision=None,
         device=None,
         num_sites: int = None,
+        azimuth_offset_deg: float = 0.0,
     ):
         """
         :param scenario_params: "isd", "bs_height", "min_bs_ut_dist"
@@ -49,13 +50,25 @@ class CellularTopology:
             deployment isn't reachable through num_rings alone.
         :param num_sectors_per_site: sectors co-located at each site.
         :param batch_size: batch dimension for bs_loc/bs_orientations.
+        :param azimuth_offset_deg: added to EVERY sector's own standard
+            boresight yaw (60/180/300 deg) uniformly, e.g. for testing how
+            shifting the horizontal beam pointing direction away from each
+            sector's own wedge center reshapes coverage. 0.0 (default) is
+            the standard tri-sector convention -- every sector still ends
+            up 120 deg apart from the others (the offset is added to all
+            three identically, so sector spacing/symmetry is preserved,
+            just rotated). Purely a diagnostic/experimentation knob for
+            now -- sector_adjacency, hotspot_region_membership, and every
+            other geometry-derived quantity below are computed from the
+            OFFSET yaw, so they stay self-consistent, but nothing yet
+            depends on this being 0.
         :param num_sites: if given, builds the normal num_rings-sized grid
             then keeps only the first num_sites sites (e.g. num_sites=1 for
             a standalone single-site/3-sector diagnostic) -- sector_adjacency
-            and corner_neighbor_ids are recomputed on the truncated set using
-            the SAME general-purpose geometry code, so a truncated topology
-            correctly reports zero cross-site neighbors (there's nothing left
-            to be adjacent to) rather than needing separate logic.
+            is recomputed on the truncated set using the SAME general-purpose
+            geometry code, so a truncated topology correctly reports zero
+            cross-site neighbors (there's nothing left to be adjacent to)
+            rather than needing separate logic.
         """
         # Assertion check for 3 sector site
         assert num_sectors_per_site == 3, (
@@ -86,18 +99,23 @@ class CellularTopology:
         bs_loc = bs_loc.unsqueeze(0).expand(batch_size, -1, -1).clone()
         dtype = bs_loc.dtype
 
-        # Standard 3-sector boresight yaws (60, 180, 300 deg)
+        # Standard 3-sector boresight yaws (60, 180, 300 deg), uniformly
+        # rotated by azimuth_offset_deg if given (see this class's own
+        # docstring -- sector spacing/symmetry is preserved, just rotated).
         sector_yaws = torch.tensor([PI / 3.0, PI, 5.0 * PI / 3.0], dtype=dtype, device=bs_loc.device)
+        sector_yaws = sector_yaws + math.radians(azimuth_offset_deg)
         bs_yaw = sector_yaws.repeat(num_cells)  # [num_bs]
         bs_yaw = bs_yaw.unsqueeze(0).expand(batch_size, -1).unsqueeze(-1)  # [batch, num_bs, 1]
 
-        # Mechanical downtilt toward a nominal sector-center distance.
-        # Vertical drop is to typical UE height, not all the way to ground.
-        ut_height = scenario_params.get("min_ut_height", torch.zeros_like(bs_height))
-        sector_center = (self.min_bs_ut_dist + 0.5 * isd) * 0.5
-        bs_downtilt = torch.atan2(bs_height - ut_height, sector_center)
+        # Mechanical pitch: horizontal (0 deg, boresight parallel to ground)
+        # -- NOT aimed at a computed "sector center" distance (2026-10-08,
+        # replacing the old atan2-toward-sector_center formula, which gave
+        # e.g. UMa a 9.36 deg baked-in mechanical downtilt before any
+        # electrical tilt was even applied; real BS antennas aren't
+        # mechanically aimed at a calculated sector-center point like that).
+        # Every degree of downtilt now comes from ElectricalDowntilt alone.
         num_bs = num_cells * num_sectors_per_site
-        bs_pitch = torch.full((batch_size, num_bs, 1), bs_downtilt.item(), dtype=dtype, device=bs_loc.device)
+        bs_pitch = torch.zeros(batch_size, num_bs, 1, dtype=dtype, device=bs_loc.device)
         bs_roll = torch.zeros(batch_size, num_bs, 1, dtype=dtype, device=bs_loc.device)
 
         self.bs_loc = bs_loc
@@ -141,35 +159,36 @@ class CellularTopology:
         for i, nl in enumerate(neighbor_lists):
             self.neighbor_ids[i, :len(nl)] = nl
 
-        # Corner-only neighbors (share a hex vertex, not an edge) -- used by
-        # compute_observation_windows and for expanded neighbor-tilt visibility.
-        self.corner_neighbor_ids = self._compute_corner_neighbor_ids()
-        self.max_corner_neighbors = self.corner_neighbor_ids.shape[1]
-        self.expanded_neighbor_mask = self.sector_adjacency.copy()
-        for i in range(num_bs):
-            for j in self.corner_neighbor_ids[i][self.corner_neighbor_ids[i] >= 0]:
-                self.expanded_neighbor_mask[i, j] = True
-
-        logger.info("CellularTopology constructed: num_cells=%d num_bs=%d isd=%.1f max_neighbors=%d "
-                   "max_corner_neighbors=%d", self.num_cells, self.num_bs, self.isd, self.max_neighbors,
-                   self.max_corner_neighbors)
+        logger.info("CellularTopology constructed: num_cells=%d num_bs=%d isd=%.1f max_neighbors=%d",
+                   self.num_cells, self.num_bs, self.isd, self.max_neighbors)
 
     @staticmethod
     def _compute_sector_adjacency(bs_xy: np.ndarray, boresight_rad: np.ndarray, isd: float) -> np.ndarray:
         """[num_sectors, num_sectors] bool, symmetric, diagonal False --
-        sector j is a neighbor of sector i if they're co-located (same
-        site), or if sector i's own rhombus territory shares an outer edge
-        with sector j's. A regular hexagon splits into 3 congruent rhombi
-        when cut from its center to alternating vertices, one per sector
-        -- each rhombus has 4 edges: 2 RADIAL edges shared with its 2
-        same-site siblings (handled by the same-site case), and 2 OUTER
-        (hex-perimeter) edges, each shared with exactly ONE specific
-        sector at a neighboring site -- the outward direction through
-        each outer edge's midpoint is boresight +-30 deg, at distance ISD.
-        Which of that neighboring site's 3 sectors actually owns the
-        shared edge is found by the SAME test run in reverse (does that
-        candidate sector's own outer-edge direction point back at this
-        site).
+        sector j is a neighbor of sector i if sector i's own rhombus
+        territory shares an OUTER edge with sector j's (a cross-site
+        neighbor). A regular hexagon splits into 3 congruent rhombi when
+        cut from its center to alternating vertices, one per sector --
+        each rhombus has 4 edges: 2 RADIAL edges shared with its 2
+        same-site siblings, and 2 OUTER (hex-perimeter) edges, each shared
+        with exactly ONE specific sector at a neighboring site -- the
+        outward direction through each outer edge's midpoint is boresight
+        +-30 deg, at distance ISD. Which of that neighboring site's 3
+        sectors actually owns the shared edge is found by the SAME test
+        run in reverse (does that candidate sector's own outer-edge
+        direction point back at this site).
+
+        Same-site siblings are deliberately EXCLUDED (2026-09-20, were
+        previously always adjacent) -- measured: a sector's own tilt
+        change produces ~0.03dB mean |SINR delta| on its same-site
+        siblings vs ~0.32dB on its genuine cross-site front neighbors (the
+        ones this method finds), a ~10x gap. Same-site co-location means
+        near-zero path-loss differentiation and no antenna-reach effect
+        between siblings, so they were never really "coupled" in the
+        sense this adjacency is meant to capture (overshoot, per-neighbor
+        state, reward) -- they were only ever adjacent by a geometric
+        technicality (sharing a radial division line, not a real
+        propagation boundary).
 
         This definition supersedes an earlier, coarser site-distance-only
         version (any sector at a nearest-neighbor SITE counted as a
@@ -188,7 +207,7 @@ class CellularTopology:
         site_dist = np.linalg.norm(bs_xy[:, None, :] - bs_xy[None, :, :], axis=-1)
         same_site = site_dist < 1e-6
 
-        adjacency = same_site.copy()
+        adjacency = np.zeros((num_sectors, num_sectors), dtype=bool)
         for i in range(num_sectors):
             for edge_dir in (boresight_rad[i] - np.pi / 6, boresight_rad[i] + np.pi / 6):
                 target = bs_xy[i] + isd * np.array([np.cos(edge_dir), np.sin(edge_dir)])
@@ -351,10 +370,7 @@ class CellularTopology:
             idx_unresolved = np.where(unresolved)[0]
 
             # Check if the UE is inside this sector
-            d = ut_xy[idx_unresolved] - bs_xy[s]
-            cross = e1[s, 0] * e2[s, 1] - e1[s, 1] * e2[s, 0]
-            alpha = (d[:, 0] * e2[s, 1] - d[:, 1] * e2[s, 0]) / cross
-            beta = (e1[s, 0] * d[:, 1] - e1[s, 1] * d[:, 0]) / cross
+            alpha, beta = self.sector_alpha_beta(s, ut_xy[idx_unresolved])
 
             inside = (alpha >= 0) & (alpha < 1) & (beta >= 0) & (beta < 1)
             matched = idx_unresolved[inside]
@@ -374,168 +390,115 @@ class CellularTopology:
         logger.function("assign_to_sector_rhombus_grid end")
         return sector_idx, cell_idx
 
-    def _compute_corner_neighbor_ids(self) -> np.ndarray:
-        """[num_bs, max_corner_neighbors] int, -1-padded: sectors sharing a
-        rhombus CORNER (a hex vertex) with sector i but NOT already an
-        edge-adjacent neighbor (those are in neighbor_ids). Only 3 of a
-        rhombus's 4 corners are hex vertices -- E1 (boresight-60deg), Far
-        (boresight), E2 (boresight+60deg); the 4th corner is the site
-        center, shared only with the 2 same-site siblings already covered
-        via edges. Each hex vertex is shared by up to 3 hexagons in a full
-        tiling; num_rings=1 leaves some vertices on the network boundary
-        with fewer, so counts are NOT uniform across sectors.
+    def sector_basis(self, sector_idx: int) -> tuple:
+        """(bs_xy, e1, e2) for one sector -- thin accessor over the cache
+        build_sector_rhombus_grid populates (must be called first)."""
+        return (self._sector_grid_bs_xy[sector_idx],
+               self._sector_grid_e1[sector_idx], self._sector_grid_e2[sector_idx])
+
+    def sector_alpha_beta(self, sector_idx: int, xy: np.ndarray) -> tuple:
+        """Raw (alpha, beta) oblique coords of xy [N,2] in sector_idx's own
+        rhombus basis -- NOT clipped to [0,1); the same Cramer's-rule
+        projection assign_to_sector_rhombus_grid uses inline, factored out
+        so both share one implementation.
         """
-        bs_xy = self.bs_loc[0, :, :2].detach().cpu().numpy()
-        boresight_rad = self.bs_orientations[0, :, 0].detach().cpu().numpy()
-        side_length = float(self.grid.cell_radius.item())
-        num_bs = self.num_bs
+        bs_xy, e1, e2 = self.sector_basis(sector_idx)
+        d = xy - bs_xy
+        cross = e1[0] * e2[1] - e1[1] * e2[0]
+        alpha = (d[:, 0] * e2[1] - d[:, 1] * e2[0]) / cross
+        beta = (e1[0] * d[:, 1] - e1[1] * d[:, 0]) / cross
+        return alpha, beta
 
-        e1 = side_length * np.stack([np.cos(boresight_rad - np.pi / 3), np.sin(boresight_rad - np.pi / 3)], axis=-1)
-        e2 = side_length * np.stack([np.cos(boresight_rad + np.pi / 3), np.sin(boresight_rad + np.pi / 3)], axis=-1)
-        corner_pts = {"e1": bs_xy + e1, "far": bs_xy + e1 + e2, "e2": bs_xy + e2}
-
-        tol = self.isd * 0.02
-        corner_only = [set() for _ in range(num_bs)]
-        for pts in corner_pts.values():
-            for other_pts in corner_pts.values():
-                for i in range(num_bs):
-                    d = np.linalg.norm(other_pts - pts[i], axis=-1)
-                    for j in np.where(d < tol)[0]:
-                        if j != i:
-                            corner_only[i].add(int(j))
-        for i in range(num_bs):
-            corner_only[i] -= set(self.neighbor_ids[i][self.neighbor_ids[i] >= 0].tolist())
-
-        max_corner_neighbors = max((len(s) for s in corner_only), default=0)
-        corner_neighbor_ids = np.full((num_bs, max_corner_neighbors), -1, dtype=int)
-        for i, s in enumerate(corner_only):
-            ids = sorted(s)
-            corner_neighbor_ids[i, :len(ids)] = ids
-
-        counts = [len(s) for s in corner_only]
-        logger.info("_compute_corner_neighbor_ids: counts min=%d max=%d mean=%.1f",
-                   min(counts, default=0), max(counts, default=0), float(np.mean(counts)) if counts else 0.0)
-        return corner_neighbor_ids
-
-    def compute_observation_windows(self, cell_size_m: float) -> list:
-        """Nine fixed-purpose spatial observation windows per sector, over
-        the sector's own rhombus grid (built via build_sector_rhombus_grid)
-        plus context borrowed from neighboring sectors' own grids -- NOT an
-        information-preserving partition of the 36 own cells. Windows are
-        deliberately allowed to overlap (an own boundary cell can be a
-        member of both its interior partition context and a seam window)
-        and to vary slightly in member count at the network boundary
-        (fewer real sectors meet there) -- see project memory
-        project_drl_state_taxonomy_v2 and the halo/pooling design
-        discussion for rationale. Requires build_sector_rhombus_grid to
-        have been called first with the SAME cell_size_m.
-
-        Nine windows per sector, in a fixed order:
-          "center"      -- own middle 2x2, pure interior context.
-          "edge_beta0", "edge_alpha0", "edge_alphaN", "edge_betaN"
-                        -- seam context: 2 own boundary cells (nearest the
-                           seam's midpoint) + 2 matching cells from the
-                           neighbor across that edge (fewer if no neighbor
-                           exists there, e.g. a network-boundary sector).
-          "corner_C", "corner_E1", "corner_Far", "corner_E2"
-                        -- vertex context: this sector's own nearest cell
-                           to that vertex + the nearest cell of every OTHER
-                           sector (edge- or corner-only-adjacent) that also
-                           touches that same vertex.
-
-        :param cell_size_m: must match the value already passed to
-            build_sector_rhombus_grid (reuses its cached grid_points/n).
-        :output: [num_bs] list of dict[window_name -> list[(sector_idx, cell_idx)]].
+    def set_hotspot_region_lut(self, near_mask: np.ndarray, mid_mask: np.ndarray) -> None:
+        """Installs the calibrated near/mid (i, j) lookup table that
+        hotspot_region_membership reads from -- see that method's own
+        docstring. Must be called once, before any hotspot_region_membership
+        call (SimulationEngine._calibrate_hotspot_region_lut does this in
+        __init__, before mobility/UE placement, which is the first real
+        consumer). :param near_mask, mid_mask: [n, n] bool, n =
+        self._sector_grid_n (set by build_sector_rhombus_grid, must be
+        called first) -- mutually exclusive, both False = far.
         """
-        logger.function("compute_observation_windows start: cell_size_m=%.2f", cell_size_m)
-        grid_points, n = self.build_sector_rhombus_grid(cell_size_m)  # [num_bs, n*n, 2]
-        num_bs = self.num_bs
-        mid = n // 2
-        cell_size = float(self.grid.cell_radius.item()) / n
-        edge_match_threshold = cell_size * 1.5
-        # A cell's centroid sits well off its own corner point (~1.5-1.7 cell
-        # widths for this rhombus geometry), unlike an edge midpoint where the
-        # boundary cell centroid is much closer -- needs a looser threshold.
-        corner_match_threshold = cell_size * 2.5
+        n = self._sector_grid_n
+        assert near_mask.shape == (n, n) and mid_mask.shape == (n, n), \
+            f"hotspot region LUT shape must be ({n},{n}) to match the current grid resolution"
+        assert not (near_mask & mid_mask).any(), "near_mask/mid_mask must be mutually exclusive"
+        self._hotspot_region_lut_near = near_mask
+        self._hotspot_region_lut_mid = mid_mask
 
-        def flat(a, b):
-            return a * n + b
+    def hotspot_region_membership(self, sector_idx: int, xy: np.ndarray) -> dict:
+        """Near/Mid/Far hotspot region membership for points xy [N,2] --
+        from sector_idx's OWN rhombus geometry only, no neighbor-sector
+        extension.
 
-        edge_names = ["beta0", "alpha0", "alphaN", "betaN"]
-        edge_cells = {
-            "beta0": [(mid - 1, 0), (mid, 0)],
-            "alpha0": [(0, mid - 1), (0, mid)],
-            "alphaN": [(n - 1, mid - 1), (n - 1, mid)],
-            "betaN": [(mid - 1, n - 1), (mid, n - 1)],
-        }
-        corner_cell = {"C": (0, 0), "E1": (n - 1, 0), "Far": (n - 1, n - 1), "E2": (0, n - 1)}
-        # Which 2 edges meet at each corner (for finding that corner's side-neighbors)
-        corner_edges = {"C": ("beta0", "alpha0"), "E1": ("beta0", "alphaN"),
-                        "Far": ("alphaN", "betaN"), "E2": ("alpha0", "betaN")}
+        near/mid/far come from a calibrated (i, j) lookup table (see
+        set_hotspot_region_lut), built from each cell's RADIAL DISTANCE to
+        its own site (2026-09-29, see SimulationEngine's own
+        _HOTSPOT_NEAR_DIST_M/_HOTSPOT_FAR_DIST_M -- 900/2300 m). Two
+        earlier rules were tried and rejected:
+          - a closed-form "closeness to the boresight diagonal" rule
+            (2026-09-20): even after excluding the min_bs_ut_dist zone,
+            its near/mid bands formed a long diagonal WEDGE stretching all
+            the way to the sector's outer edge, nothing like the real
+            high-SINR footprint (confirmed against real simulated SINR and
+            visually against spatial_heatmaps_by_tilt_binned.png).
+          - a real-SINR-VALUE rule (2026-09-22): classified each cell by
+            its simulated SINR at a frozen 0-deg/all-sectors/forced-LOS/
+            no-shadow reference condition, 5/0 dB cuts. Worked, but
+            entangled RADIAL distance with AZIMUTHAL interference geometry
+            (a cell's SINR depends on proximity to a shared sector
+            boundary too, not just distance from its own site) -- its
+            near/mid/far bands didn't line up with the two-population
+            tilt-coverage reversal found empirically by sweeping tilt
+            against PURE distance bins (scripts/radial_swap_plot.png,
+            2026-09-28/29): cells under ~900m genuinely prefer downtilt,
+            cells from ~900-2300m genuinely prefer uptilt, roles reversing
+            cleanly. Tilt is an elevation-only control with NO azimuthal
+            effect, so radial distance -- not SINR value, not diagonal
+            proximity -- is the axis that actually matches what tilt can
+            influence. A pure distance rule also needs no frozen reference
+            condition and no radio simulation pass at all to calibrate,
+            unlike the SINR-value rule it replaced.
 
-        corner_neighbor_ids = self.corner_neighbor_ids
+        Points within min_bs_ut_dist of the site are excluded from
+        `inside` (and therefore from near/mid/far) entirely, and never
+        enter the calibration ranking either: no real UE can ever be
+        placed there (helpers/ue_drop.py enforces this everywhere UEs are
+        dropped), so any point that close is either outside the reachable
+        network or an antenna near-field null -- confirmed to be one of
+        the WORST-SINR cells in its sector, not the best, at both 50m and
+        20m. This is the same exclusion helpers/ue_drop.py:290-296
+        already had to bolt on by hand at every "near" UE-placement call
+        site, and helpers/spatial_grid_estimator.py's own
+        estimable_cell_mask applies for the same underlying reason (no
+        measurement can ever exist there) -- centralized here instead of
+        re-derived per caller.
 
-        def nearest_cell(sector_j, world_pt):
-            d = np.linalg.norm(grid_points[sector_j] - world_pt[None, :], axis=-1)
-            return int(d.argmin())
+        :output: dict(alpha, beta, eta, inside, near, mid, far) -- each
+            [N]. Every `inside` point gets exactly one of near/mid/far --
+            no excluded "hole" near the site beyond the min_bs_ut_dist
+            exclusion above.
+        """
+        bs_xy, _, _ = self.sector_basis(sector_idx)
+        alpha, beta = self.sector_alpha_beta(sector_idx, xy)
+        dist_to_site = np.linalg.norm(xy - bs_xy[None, :], axis=-1)
+        inside = ((alpha >= 0) & (alpha < 1) & (beta >= 0) & (beta < 1)
+                 & (dist_to_site >= float(self.min_bs_ut_dist)))
+        eta = np.maximum(alpha, beta)
+        n = self._sector_grid_n
+        assert hasattr(self, "_hotspot_region_lut_near"), \
+            "hotspot_region_membership needs set_hotspot_region_lut() called first (see SimulationEngine.__init__)"
+        i_idx = np.clip(np.floor(alpha * n).astype(int), 0, n - 1)
+        j_idx = np.clip(np.floor(beta * n).astype(int), 0, n - 1)
+        near = inside & self._hotspot_region_lut_near[i_idx, j_idx]
+        mid = inside & ~near & self._hotspot_region_lut_mid[i_idx, j_idx]
+        far = inside & ~near & ~mid
+        # near_mid: purely derived (near | mid), added for consumers that
+        # only need a coarser 2-way (near_mid vs far) split -- e.g.
+        # HotspotDemandMobility's own demand-state clustering -- without
+        # changing the near/mid/far split itself for every other consumer
+        # (RegionalInfoProvider, OccupancyEstimator, debug_pipeline_audit.py).
+        near_mid = near | mid
+        return dict(alpha=alpha, beta=beta, eta=eta, inside=inside, near=near, mid=mid, far=far,
+                    near_mid=near_mid)
 
-        def match_edges_to_neighbors(i):
-            """Greedy 1-to-1 assignment of sector i's up-to-4 edges to its
-            listed neighbor_ids, by minimum boundary-cell distance --
-            verified against neighbor_ids counts across all 21 sectors."""
-            cands = self.neighbor_ids[i][self.neighbor_ids[i] >= 0]
-            edge_pts = {e: np.stack([grid_points[i, flat(a, b)] for a, b in cells])
-                       for e, cells in edge_cells.items()}
-            pairs = []
-            for ename in edge_names:
-                for ji, j in enumerate(cands):
-                    d = np.linalg.norm(grid_points[j][:, None, :] - edge_pts[ename][None, :, :], axis=-1).min()
-                    pairs.append((d, ename, ji))
-            pairs.sort(key=lambda t: t[0])
-            assignment, used_j = {e: None for e in edge_names}, set()
-            for d, ename, ji in pairs:
-                if d > edge_match_threshold:
-                    break
-                if assignment[ename] is not None or ji in used_j:
-                    continue
-                assignment[ename] = int(cands[ji])
-                used_j.add(ji)
-            return assignment
-
-        windows = [dict() for _ in range(num_bs)]
-        for i in range(num_bs):
-            edge_neighbor = match_edges_to_neighbors(i)
-
-            # Center window: own middle 2x2
-            windows[i]["center"] = [(i, flat(a, b)) for a in (mid - 1, mid) for b in (mid - 1, mid)]
-
-            # Edge windows: my 2 boundary cells + neighbor's 2 nearest matching cells (if any)
-            for ename in edge_names:
-                members = [(i, flat(a, b)) for a, b in edge_cells[ename]]
-                j = edge_neighbor[ename]
-                if j is not None:
-                    for a, b in edge_cells[ename]:
-                        members.append((j, nearest_cell(j, grid_points[i, flat(a, b)])))
-                windows[i][f"edge_{ename}"] = members
-
-            # Corner windows: my 1 nearest cell + every other sector touching that vertex's 1 nearest cell
-            for cname, (a, b) in corner_cell.items():
-                vertex_pt = grid_points[i, flat(a, b)]
-                members = [(i, flat(a, b))]
-                for ename in corner_edges[cname]:
-                    j = edge_neighbor[ename]
-                    if j is not None:
-                        members.append((j, nearest_cell(j, vertex_pt)))
-                for j in corner_neighbor_ids[i][corner_neighbor_ids[i] >= 0]:
-                    # Only sectors whose OWN nearest cell is actually close to this vertex
-                    # (a corner-only neighbor may sit at a DIFFERENT one of sector i's 3 hex vertices)
-                    j_cell = nearest_cell(j, vertex_pt)
-                    if np.linalg.norm(grid_points[j, j_cell] - vertex_pt) < corner_match_threshold:
-                        members.append((int(j), j_cell))
-                windows[i][f"corner_{cname}"] = members
-
-        sizes = [len(w) for win in windows for w in win.values()]
-        logger.info("compute_observation_windows: %d windows/sector, member count min=%d max=%d mean=%.1f",
-                   len(windows[0]), min(sizes), max(sizes), float(np.mean(sizes)))
-        logger.function("compute_observation_windows end")
-        return windows

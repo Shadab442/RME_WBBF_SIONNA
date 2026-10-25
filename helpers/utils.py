@@ -2,10 +2,9 @@
 
 Config loading: config.yaml is grouped by topic (topology, antenna, channel,
 kpi, mobility, simulation, algorithms), plus one top-level section per
-script that needs its own extra parameters (e.g. test_tilt_window_calibration).
-load_config() returns the whole nested dict as-is -- callers index into the
-topic they need (cfg["topology"]["scenario"]) or their own script section
-(cfg["test_tilt_window_calibration"]["candidate_window_slots"]).
+script that needs its own extra parameters. load_config() returns the whole
+nested dict as-is -- callers index into the topic they need
+(cfg["topology"]["scenario"]) or their own script section.
 
 Visualization: Sionna's own sionna.sys.topology.HexGrid.show() already draws
 the hexagon and sector geometry -- but it doesn't plot UE positions.
@@ -243,26 +242,31 @@ def compute_cell_colors(xy, site_loc, num_sectors_per_site: int = 3):
     return colors, nearest_site_idx
 
 
-def add_cluster_ellipses(ax, cluster_centers, cluster_radius, **ellipse_kwargs):
+def add_cluster_ellipses(ax, cluster_centers, cluster_radius, edgecolors=None, **ellipse_kwargs):
     """Draws one circle (an Ellipse with equal width/height) per cluster
     center, radius ``cluster_radius`` -- the exact deviation_radius a
     ReferencePointGroupMobility cluster was built with, not a statistical
     fit to its (often just 2-3) member positions, which would be noisy and
-    could misleadingly exclude/include members by chance. Deliberately
-    plain black outlines regardless of site/sector -- see
-    ``compute_cell_colors`` for coloring the UEs themselves instead.
+    could misleadingly exclude/include members by chance. Plain black
+    outlines by default (regardless of site/sector) unless ``edgecolors``
+    is given -- see ``compute_cell_colors`` for coloring the UEs
+    themselves instead.
 
     :param cluster_centers: [num_clusters, 2] (x, y) -- e.g. a
         ReferencePointGroupMobility's ``ref_xy``.
     :param cluster_radius: shared radius [m] for every cluster's circle.
+    :param edgecolors: optional [num_clusters] sequence -- one outline
+        color PER cluster (e.g. to match each cluster's own member-point
+        color), overriding the uniform default/``edgecolor`` kwarg.
     :output: list of the created Ellipse patches (e.g. to update their
         ``.center`` per animation frame).
     """
     style = dict(fill=False, edgecolor="black", linewidth=1.0, alpha=0.6)
     style.update(ellipse_kwargs)
     patches = []
-    for cx, cy in cluster_centers:
-        patch = Ellipse((float(cx), float(cy)), width=2 * cluster_radius, height=2 * cluster_radius, **style)
+    for i, (cx, cy) in enumerate(cluster_centers):
+        this_style = dict(style, edgecolor=edgecolors[i]) if edgecolors is not None else style
+        patch = Ellipse((float(cx), float(cy)), width=2 * cluster_radius, height=2 * cluster_radius, **this_style)
         ax.add_patch(patch)
         patches.append(patch)
     return patches
@@ -373,15 +377,13 @@ class _MobilityAnimationUpdater:
     save_mobility_animation -- a class instead of a closure so per-frame
     state (scatter/ellipses/ax) lives as attributes, not captured locals."""
 
-    def __init__(self, ax, scatter, ellipses, position_history, ref_xy_history,
-                mobility_model, tilt_control_interval_s):
+    def __init__(self, ax, scatter, ellipses, position_history, ref_xy_history, mobility_model):
         self.ax = ax
         self.scatter = scatter
         self.ellipses = ellipses
         self.position_history = position_history
         self.ref_xy_history = ref_xy_history
         self.mobility_model = mobility_model
-        self.tilt_control_interval_s = tilt_control_interval_s
 
     def __call__(self, frame):
         self.scatter.set_offsets(self.position_history[frame, :, :2])
@@ -390,18 +392,16 @@ class _MobilityAnimationUpdater:
             for patch, (cx, cy) in zip(self.ellipses, self.ref_xy_history[frame]):
                 patch.set_center((float(cx), float(cy)))
             artists.extend(self.ellipses)
-        elapsed_s = frame * self.tilt_control_interval_s
-        self.ax.set_title(f"{self.mobility_model}: tilt control interval {frame}, elapsed time {elapsed_s:g} s")
+        self.ax.set_title(f"{self.mobility_model}: tilt control interval {frame}")
         return artists
 
 
 def save_mobility_animation(cfg, out_dir, topology, position_history, ref_xy_history=None,
                             deviation_radius=None, member_group_idx=None):
     """Save the same style of position animation as verify_mobility.py.
-    One frame per TILT CONTROL INTERVAL (each interval's first measurement
-    draw), not per measurement draw -- 150,000 individual frames would make
-    for an unusable animation; this keeps the frame count to
-    num_tilt_control_intervals, each frame spanning tilt_control_interval_s.
+    One frame per TILT CONTROL INTERVAL -- the actual per-interval UE
+    positions the simulation uses (one measurement per interval), not an
+    interpolated/synthetic elapsed-time sequence.
 
     One circle per cluster (its exact deviation_radius, not a statistical
     fit to its few member positions) is drawn and updated from
@@ -415,8 +415,7 @@ def save_mobility_animation(cfg, out_dir, topology, position_history, ref_xy_his
     frame (which would make colors flicker as clusters cross boundaries).
     """
     logger.function("save_mobility_animation start")
-    mobility_model = cfg["mobility"]["cluster_mobility_mode"]
-    tilt_control_interval_s = cfg["simulation"]["tilt_control_interval_s"]
+    mobility_model = cfg["mobility"]["common"]["cluster_mobility_mode"]
     num_tilt_control_intervals = cfg["simulation"]["num_tilt_control_intervals"]
     animation_fps = cfg["simulation"].get("animation_fps", 10)
 
@@ -440,8 +439,7 @@ def save_mobility_animation(cfg, out_dir, topology, position_history, ref_xy_his
     if ref_xy_history is not None:
         ellipses = add_cluster_ellipses(ax, ref_xy_history[0], deviation_radius)
 
-    update = _MobilityAnimationUpdater(ax, scatter, ellipses, position_history, ref_xy_history,
-                                       mobility_model, tilt_control_interval_s)
+    update = _MobilityAnimationUpdater(ax, scatter, ellipses, position_history, ref_xy_history, mobility_model)
     animation = FuncAnimation(fig, update, frames=num_tilt_control_intervals, blit=False)
     path = os.path.join(out_dir, "mobility_animation.gif")
     animation.save(path, writer=PillowWriter(fps=animation_fps))

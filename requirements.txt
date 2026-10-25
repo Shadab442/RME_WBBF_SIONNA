@@ -9,6 +9,7 @@
 # the extra index below is required for `pip install -r requirements.txt` to find them.
 --extra-index-url https://download.pytorch.org/whl/cu128
 
+absl-py==2.5.0
 anyio==4.12.1
 argon2-cffi==25.1.0
 argon2-cffi-bindings==25.1.0
@@ -46,6 +47,7 @@ h5py==3.16.0
 httpcore==1.0.9
 httpx==0.28.1
 idna==3.11
+immutabledict==4.3.1
 importlib_resources==6.5.2
 ipydatawidgets==4.3.5
 ipykernel==7.2.0
@@ -106,6 +108,7 @@ nvidia-nccl-cu12==2.28.9
 nvidia-nvjitlink-cu12==12.8.93
 nvidia-nvshmem-cu12==3.4.5
 nvidia-nvtx-cu12==12.8.90
+ortools==9.15.6755
 packaging==26.0
 pandas==3.0.1
 pandocfilters==1.5.1
@@ -116,6 +119,7 @@ platformdirs==4.9.4
 plotly==6.6.0
 prometheus_client==0.24.1
 prompt_toolkit==3.0.52
+protobuf==6.33.6
 psutil==7.2.2
 ptyprocess==0.7.0
 pure_eval==0.2.3

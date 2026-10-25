@@ -1,5 +1,5 @@
 """CartPole-v1 sanity check for our OWN DQN machinery (drl/dqn.py,
-algorithm/wesn.py, drl/replay_buffer.py's ReplayBuffer) -- a standard, well-
+algorithm/gradient_based_wesn.py, drl/replay_buffer.py's ReplayBuffer) -- a standard, well-
 understood RL benchmark, completely independent of the real tilt-control
 pipeline's top_k_neighbor state/reward design.
 

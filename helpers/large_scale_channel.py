@@ -57,15 +57,28 @@ class LargeScaleChannel:
         calls in a row with no intervening ``set_topology()`` return
         identical shadow fading; this is intentional (repeated queries of
         the same topology snapshot should agree), not a missed resample.
+
+        NOTE: ``_lsp.sf`` is the RAW sampled shadow fading, unaffected by
+        the channel model's own ``enable_shadow_fading`` constructor flag --
+        Sionna's own ``SystemLevelChannel._step_12`` only honors that flag
+        by overriding ``sf`` to 1 locally, right before its own (separate)
+        fast-fading pipeline uses it, never by mutating ``_lsp.sf`` itself.
+        Since this method reads ``_lsp.sf`` directly (bypassing
+        ``_step_12`` entirely), the same override is replicated here so
+        ``channel.disable_shadow_fading`` (config.yaml) actually takes
+        effect for this large-scale-only path too.
         """
         logger.function("LargeScaleChannel.generate_state start")
         scenario = self.channel_model._scenario
         pathloss_db = self.channel_model._lsp_sampler.sample_pathloss()  # [batch, num_bs, num_ue]
+        sf = self.channel_model._lsp.sf
+        if not scenario.shadow_fading_enabled:
+            sf = torch.ones_like(sf)
         # Sionna's own SystemLevelChannel._step_12 applies sf as a LINEAR
         # POWER GAIN: amplitude *= 10**(-pathloss_db/20) * sqrt(sf). So a
         # sf > 1 (favorable shadowing) must REDUCE total loss -- subtract
         # its dB equivalent, don't add it.
-        shadow_fading_db = 10.0 * torch.log10(self.channel_model._lsp.sf)
+        shadow_fading_db = 10.0 * torch.log10(sf)
         total_pathloss_db = pathloss_db - shadow_fading_db
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("generate_state: total_pathloss_db mean=%.2f min=%.2f max=%.2f",

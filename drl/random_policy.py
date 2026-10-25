@@ -41,7 +41,7 @@ class RandomPolicy(TiltPolicy):
         logger.function("RandomPolicy.act end")
         return actions
 
-    def observe(self, observations, actions, rewards, next_observations, terminal, mask=None):
+    def observe(self, observations, actions, rewards, next_observations, terminal, mask=None, training=True):
         pass
 
     def save(self, path):

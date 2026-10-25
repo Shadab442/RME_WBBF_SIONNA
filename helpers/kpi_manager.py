@@ -1,7 +1,6 @@
 """Per-UE downlink KPIs (SINR, RSRP, coverage, overshoot) across candidate
-sectors (KpiManager), plus pooling raw measurement draws into either the
-shared tilt-control-interval boundary or DRL's own per-sector staggered
-window (IntervalMeasurementPool).
+sectors -- a pure function of (channel state, tilt) to power/KPIs, reused
+by every one of a tilt-control interval's algorithms.
 
 Large-scale only: pathloss + shadow fading, no fast/frequency-selective
 fading.
@@ -21,7 +20,7 @@ logger = get_logger(__name__)
 
 class KpiManager:
     """Pure function of (channel state, tilt) -> received power/KPIs --
-    holds no pooling state of its own (see IntervalMeasurementPool below).
+    holds no pooling state of its own.
 
     :param sector_etilts: One :class:`~helpers.electrical_downtilt.ElectricalDowntilt`
         per sector, in the same order as the channel model's tx (BS) dimension.
@@ -75,8 +74,8 @@ class KpiManager:
     def resolve_power_at_tilt(self, state: LargeScaleState, tilt_deg_per_sector) -> np.ndarray:
         """Sets every sector to tilt_deg_per_sector and resolves power --
         [batch, sector, ue], numpy. The one place sector_etilts gets
-        mutated for a single-tilt resolve, so callers (IntervalMeasurementPool)
-        never touch sector_etilts directly.
+        mutated for a single-tilt resolve, so callers never touch
+        sector_etilts directly.
         """
         logger.function("resolve_power_at_tilt start")
         tilt_list = tilt_deg_per_sector.tolist() if hasattr(tilt_deg_per_sector, "tolist") else list(tilt_deg_per_sector)
@@ -133,11 +132,48 @@ class KpiManager:
         logger.function("_compute_serving_sinr end")
         return {"sinr_db": sinr_db, "power_db": power_db, "serving_idx": serving_idx}
 
+    def resolve_serving_idx_with_hysteresis(self, power_db: np.ndarray, previous_serving_idx: np.ndarray,
+                                            hysteresis_db: float, sector_axis: int = 1) -> np.ndarray:
+        """A3-style handover (3GPP TR 36.331-inspired, simplified: just the
+        RSRP-offset condition, no time-to-trigger/cell-individual-offset) --
+        a UE stays attached to previous_serving_idx unless some OTHER
+        sector's RSRP exceeds the CURRENT serving sector's RSRP by more
+        than hysteresis_db, in which case it switches to the best such
+        candidate. previous_serving_idx == -1 means "no prior attachment
+        yet" -- falls back to plain max-RSRP for that UE, matching
+        _compute_serving_sinr's own default (3GPP-style initial cell
+        selection).
+
+        Pure/stateless: does NOT store previous_serving_idx anywhere --
+        the caller (SimulationEngine, one persistent array per algorithm --
+        see its own module docstring) owns that state and must pass the
+        SAME array back in next time, updated with this call's own output.
+
+        :param power_db: [batch, sector, ue] (or matching sector_axis) --
+            10*log10(power_w), same convention as _compute_serving_sinr's
+            own "power_db" output.
+        :param previous_serving_idx: [batch, ue] int, -1 for "no prior
+            attachment" (e.g. this UE's very first ever measurement).
+        :param hysteresis_db: RSRP offset [dB] a candidate must exceed the
+            CURRENT serving sector by before a handover triggers.
+        :output: [batch, ue] int -- the new serving_idx.
+        """
+        best_idx = power_db.argmax(axis=sector_axis)
+        best_power = np.take_along_axis(power_db, np.expand_dims(best_idx, sector_axis),
+                                        axis=sector_axis).squeeze(sector_axis)
+        has_prior = previous_serving_idx >= 0
+        prev_safe = np.where(has_prior, previous_serving_idx, 0)
+        prev_power = np.take_along_axis(power_db, np.expand_dims(prev_safe, sector_axis),
+                                        axis=sector_axis).squeeze(sector_axis)
+        handover = has_prior & (best_power > prev_power + hysteresis_db)
+        return np.where(has_prior, np.where(handover, best_idx, previous_serving_idx), best_idx)
+
     def compute_ue_kpis(self, power_w: np.ndarray, tilt_idx_per_sector=None,
-                        threshold_db: float = None,
+                        threshold_db: float = None, rsrp_threshold_dbm: float = None,
                         ut_loc: np.ndarray = None, edge_percentile: float = None,
                         distance_threshold_m: float = None, overlap_margin_db: float = None,
-                        return_counts: bool = False, return_per_neighbor: bool = False) -> dict:
+                        return_counts: bool = False, return_per_neighbor: bool = False,
+                        previous_serving_idx: np.ndarray = None, hysteresis_db: float = None) -> dict:
         """Per-UE SINR/RSRP/serving-sector, plus coverage/overshoot, from a
         resolved power array.
 
@@ -145,6 +181,11 @@ class KpiManager:
             with tilt_idx_per_sector given
         :param tilt_idx_per_sector: [num_sectors] int array/list, optional
         :param threshold_db: also returns coverage if given
+        :param rsrp_threshold_dbm: additional gate -- a UE's own serving-
+            sector RSRP (best_power_db+30) must ALSO clear this for it to
+            count as covered, alongside threshold_db's SINR gate. None
+            (default): RSRP-independent, SINR-only coverage (old behavior).
+            Ignored if threshold_db is None (coverage isn't computed then).
         :param ut_loc: [batch, ue, 3] UE positions -- required (with
             threshold_db) for per_sector_coverage, and (with
             distance_threshold_m + overlap_margin_db) for overshoot
@@ -160,6 +201,12 @@ class KpiManager:
             denominator COUNTS behind per_sector_coverage/overshoot
             (per_sector_served_count, per_sector_covered_count,
             neighbor_served_count, overshoot_hit_count)
+        :param previous_serving_idx, hysteresis_db: if BOTH given, serving_idx
+            is resolved via resolve_serving_idx_with_hysteresis instead of
+            plain max-RSRP -- see that method's own docstring. Omitting
+            either (the default) keeps this call's own original stateless
+            argmax-RSRP behavior, unaffected -- every existing caller that
+            doesn't pass these is untouched.
         :output: dict -- sinr_db, rsrp_dbm, serving_idx [batch,ue] always;
             coverage [scalar] if threshold_db given; per_sector_coverage
             [sector] if ut_loc+threshold_db given (edge-restricted if
@@ -180,6 +227,9 @@ class KpiManager:
         # Shared signal/interference/SINR core
         core = self._compute_serving_sinr(power_w, sector_axis=1)
         serving_idx = core["serving_idx"]
+        if previous_serving_idx is not None and hysteresis_db is not None:
+            serving_idx = self.resolve_serving_idx_with_hysteresis(
+                core["power_db"], previous_serving_idx, hysteresis_db, sector_axis=1)
 
         # Reported SINR
         sinr_db = np.take_along_axis(
@@ -204,6 +254,8 @@ class KpiManager:
         # --------------------------------------------------------------
         if threshold_db is not None:
             is_covered = sinr_db > threshold_db
+            if rsrp_threshold_dbm is not None:
+                is_covered = is_covered & (rsrp_dbm > rsrp_threshold_dbm)
             result["coverage"] = float(np.mean(is_covered))
             logger.debug("compute_ue_kpis: overall coverage=%.4f", result["coverage"])
 
@@ -265,10 +317,11 @@ class KpiManager:
 
                 if served_by_i.any():
 
-                    # whole population SINR of the sector
+                    # whole population SINR/RSRP of the sector
                     sinr_i = sinr_db[served_by_i]
+                    rsrp_i = rsrp_dbm[served_by_i]
 
-                    # edge restricted SINR of the sector
+                    # edge restricted SINR/RSRP of the sector
                     if edge_percentile is not None:
                         dist_i = dist_to_site[:, i, :][served_by_i]
                         edge_threshold = np.percentile(
@@ -276,16 +329,16 @@ class KpiManager:
                         )
                         edge_mask = dist_i >= edge_threshold
                         sinr_i = sinr_i[edge_mask]
+                        rsrp_i = rsrp_i[edge_mask]
 
-                    # coverage of the sector
+                    # coverage of the sector -- SINR gate, plus RSRP gate if given
                     if sinr_i.size > 0:
-                        per_sector_coverage[i] = np.mean(
-                            sinr_i > threshold_db
-                        )
+                        is_covered_i = sinr_i > threshold_db
+                        if rsrp_threshold_dbm is not None:
+                            is_covered_i = is_covered_i & (rsrp_i > rsrp_threshold_dbm)
+                        per_sector_coverage[i] = np.mean(is_covered_i)
                         served_count[i] = sinr_i.size
-                        covered_count[i] = np.sum(
-                            sinr_i > threshold_db
-                        )
+                        covered_count[i] = np.sum(is_covered_i)
 
             # ==========================================================
             # Overshoot
@@ -393,87 +446,3 @@ class KpiManager:
         logger.function("compute_ue_kpis end")
         return result
 
-class IntervalMeasurementPool:
-    """Pools KpiManager's per-slot output against the shared TILT-CONTROL
-    INTERVAL boundary -- used to score Oracle/Causal/Adaptive Legacy/No
-    Tilt/DRL's own per-interval logging, all against the same pooled
-    snapshot. (DRL's own reward/state accumulation, against its own
-    per-sector staggered window rather than this shared boundary, is
-    SpatialGridEstimator's job -- see helpers/spatial_grid_estimator.py --
-    not this class's.)
-
-    :param kpi_manager: resolves power at a given tilt; this class never
-        mutates sector_etilts directly.
-    """
-
-    def __init__(self, kpi_manager: KpiManager, num_sectors: int):
-        self.kpi_manager = kpi_manager
-        self.num_sectors = num_sectors
-        self.start_interval()
-
-    # ------------------------------------------------------- interval pool
-
-    def start_interval(self):
-        """Reset accumulators for a new tilt-control interval -- no
-        retention beyond the interval currently being pooled."""
-        logger.function("IntervalMeasurementPool.start_interval")
-        self._table_chunks = []
-        self._adaptive_r0_chunks = []
-        self._drl_r0_chunks = []
-        self._no_tilt_chunks = []
-        self._ut_loc_r0_chunks = []
-
-    def pool_measurement(self, state: LargeScaleState, adaptive_tilt_deg, drl_tilt_deg,
-                         downtilt_sweep_deg, ut_loc_r0=None, needs_sweep: bool = True):
-        """One measurement draw's contribution: the swept table (Oracle/
-        Causal) plus Adaptive Legacy/DRL/No Tilt's own current-tilt power,
-        appended to this interval's running pool.
-
-        :param state: this draw's large-scale state (one realization-chunk
-            -- call once per chunk if num_realizations_per_slot exceeds a
-            single channel batch)
-        :param adaptive_tilt_deg, drl_tilt_deg: [num_sectors] current tilt [deg]
-        :param downtilt_sweep_deg: candidate tilts [deg] for the swept table
-        :param ut_loc_r0: [num_ue, 3] realization-0's UE positions this draw
-            -- only given on the chunk containing realization 0
-        :param needs_sweep: if False, skips building the swept
-            [tilt, sector, ue] table -- only Dynamic Local Oracle/Causal's
-            coordinate-ascent search needs it
-        :output: this draw's resolved DRL power, [sector, ue] (realization
-            0's slice, batch dim dropped) -- lets a caller reuse it (e.g.
-            for a per-sector rolling-window accumulator) without resolving
-            the same power a second time.
-        """
-        logger.function("pool_measurement start: needs_sweep=%s", needs_sweep)
-        if needs_sweep:
-            self._table_chunks.append(self.kpi_manager.compute_tilt_sector_ue_rx_power(state, downtilt_sweep_deg))
-
-        adaptive_power_w = self.kpi_manager.resolve_power_at_tilt(state, adaptive_tilt_deg)
-        drl_power_w = self.kpi_manager.resolve_power_at_tilt(state, drl_tilt_deg)
-
-        if ut_loc_r0 is not None:
-            self._adaptive_r0_chunks.append(adaptive_power_w[0])  # -> [sector, ue]
-            self._drl_r0_chunks.append(drl_power_w[0])
-            self._ut_loc_r0_chunks.append(ut_loc_r0)
-
-        no_tilt_power_w = self.kpi_manager.resolve_power_at_tilt(state, np.zeros(self.num_sectors))
-        self._no_tilt_chunks.append(no_tilt_power_w)
-
-        logger.function("pool_measurement end")
-        return drl_power_w[0]
-
-    def pooled_interval(self) -> dict:
-        """Concatenates this interval's accumulated measurement draws into
-        the pooled result. Call start_interval() again before the next one.
-        """
-        logger.function("pooled_interval start")
-        pooled = {
-            "power_table": np.concatenate(self._table_chunks, axis=1) if self._table_chunks else None,
-            "adaptive_power_w_r0": np.concatenate(self._adaptive_r0_chunks, axis=1),
-            "drl_power_w_r0": np.concatenate(self._drl_r0_chunks, axis=1),
-            "no_tilt_power_w": np.concatenate(self._no_tilt_chunks, axis=0),
-            "ut_loc_r0": np.concatenate(self._ut_loc_r0_chunks, axis=0),
-        }
-        logger.debug("pooled_interval: drl_power_w_r0 shape=%s", pooled["drl_power_w_r0"].shape)
-        logger.function("pooled_interval end")
-        return pooled

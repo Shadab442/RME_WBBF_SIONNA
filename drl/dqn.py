@@ -15,7 +15,7 @@ import torch
 from drl.base import TiltPolicy
 from drl.replay_buffer import ReplayBuffer
 from algorithm.mlp import Mlp
-from algorithm.wesn import Wesn
+from algorithm.gradient_based_wesn import Wesn
 from helpers.utils import get_logger
 
 logger = get_logger(__name__)
@@ -42,15 +42,23 @@ class Dqn(TiltPolicy):
         epsilon_decay_rate: float = 0.985,
         algorithm_seed: int = 0,
         device: str = "cpu",
+        expose_diagnostics: bool = False,
     ):
         """
         :param algorithm_seed: seeds EVERYTHING algorithm-side
         :param train_steps_per_interval: gradient steps taken per sector at
             each observe() call
+        :param expose_diagnostics: if True, act() also populates
+            last_decision_info (see TiltPolicy's own docstring) with the
+            full Q-vector even on exploratory/forced-random steps -- costs
+            one extra forward pass per such step (none on a greedy step,
+            which already computes it). False (default): epsilon/
+            exploratory are still recorded for free, but q_values stays
+            None on those steps -- zero added cost.
         :param model: "mlp" | "wesn". MLP is a stateless per-sample Q-network
             (hidden_sizes only). WESN is a fixed random reservoir + one
             trained readout that reads a WINDOW of a sector's own last
-            sequence_length decisions (see algorithm/wesn.py) -- gives the
+            sequence_length decisions (see algorithm/gradient_based_wesn.py) -- gives the
             Q-network short-term memory across a sector's own history,
             which plain MLP lacks.
         :param sequence_length: wesn only -- window length (in this
@@ -95,6 +103,7 @@ class Dqn(TiltPolicy):
 
         # Others
         self.device = device
+        self.expose_diagnostics = expose_diagnostics
 
         # One shared dedicated rng for all algorithm-side
         self.rng = random.Random(algorithm_seed)
@@ -141,6 +150,35 @@ class Dqn(TiltPolicy):
 
         return epsilon
 
+    def _build_state(self, sector, observations):
+        """The [1, ...] network input for `sector`, or None if a real one
+        can't be formed yet (wesn only -- fewer than sequence_length-1 past
+        decisions buffered). Shared by act()'s own exploit branch and by
+        the diagnostics-only extra forward pass on exploratory/forced-
+        random steps, so both use the exact same state-construction logic.
+        """
+        if self.model == "wesn":
+            buffer = self.buffers[sector]
+            # Need sequence_length-1 past decisions buffered -- plus the
+            # current observation, that's a full sequence_length window.
+            n_history = self.sequence_length - 1
+            if len(buffer) < n_history:
+                return None
+            # sequence_length=1 means no past history at all (a length-1
+            # window is just the current observation) -- skip recent()
+            # entirely rather than ask it for 0 items from a possibly
+            # still-empty buffer, which has no feature-width to fall back
+            # on if it's never stored anything yet (see ReplayBuffer.
+            # recent's own n=0 handling for what it CAN infer once the
+            # buffer is non-empty).
+            if n_history == 0:
+                state_seq = observations[sector][None]
+            else:
+                history = buffer.recent(n_history)
+                state_seq = np.concatenate([history, observations[sector][None]], axis=0)
+            return torch.as_tensor(state_seq, dtype=torch.float32, device=self.device).unsqueeze(0)
+        return torch.as_tensor(observations[sector], dtype=torch.float32, device=self.device).unsqueeze(0)
+
     # Choose action
     def act(self, observations, training, mask=None, default_action=None):
         logger.function("Dqn.act start: training=%s", training)
@@ -148,6 +186,7 @@ class Dqn(TiltPolicy):
         # Action initialization
         actions = (np.zeros(self.num_sectors, dtype=np.int64) if default_action is None
                   else np.array(default_action, dtype=np.int64).copy())
+        self.last_decision_info = {}
 
         # for each sector
         for sector, network in enumerate(self.networks):
@@ -158,57 +197,44 @@ class Dqn(TiltPolicy):
 
             # epsilon calculation for choosing exploration or exploitation
             epsilon = self._epsilon(sector) if training else 0.0
+            info = {"epsilon": epsilon, "exploratory": False, "q_values": None}
 
             # If exploration, choose random action
             if training and self.rng.random() < epsilon:
                 actions[sector] = self.rng.randrange(self.num_actions)
+                info["exploratory"] = True
+                if self.expose_diagnostics:
+                    state = self._build_state(sector, observations)
+                    if state is not None:
+                        with torch.no_grad():
+                            info["q_values"] = network(state).squeeze(0).cpu().numpy()
+                self.last_decision_info[sector] = info
                 logger.debug("Dqn.act: choosing random action")
                 continue
 
             # If exploitation, choose model based action
-            if self.model == "wesn":
-                buffer = self.buffers[sector]
-
-                # Need sequence_length-1 past decisions buffered -- plus
-                # the current observation, that's a full sequence_length
-                # window. If not, choose random action.
-                if len(buffer) < self.sequence_length - 1:
-                    actions[sector] = self.rng.randrange(self.num_actions)
-                    logger.debug("Dqn.act: buffer < sequence length, choosing random action")
-                    continue
-
-                # If enough data in buffer, choose model based action.
-                # sequence_length=1 means no past history at all (a
-                # length-1 window is just the current observation) --
-                # skip recent() entirely rather than ask it for 0 items
-                # from a possibly still-empty buffer, which has no
-                # feature-width to fall back on if it's never stored
-                # anything yet (see ReplayBuffer.recent's own n=0 handling
-                # for what it CAN infer once the buffer is non-empty).
-                n_history = self.sequence_length - 1
-                if n_history == 0:
-                    state_seq = observations[sector][None]
-                else:
-                    history = buffer.recent(n_history)
-                    state_seq = np.concatenate([history, observations[sector][None]], axis=0)
-                state = torch.as_tensor(state_seq, dtype=torch.float32,
-                                        device=self.device).unsqueeze(0)
-                logger.debug("Dqn.act: choosing model based action")
-            else:
-                # Choose model based action
-                state = torch.as_tensor(observations[sector], dtype=torch.float32,
-                                        device=self.device).unsqueeze(0)
-                logger.debug("Dqn.act: choosing model based action")
+            state = self._build_state(sector, observations)
+            if state is None:
+                # wesn only: not enough buffered history yet for a real window
+                actions[sector] = self.rng.randrange(self.num_actions)
+                info["exploratory"] = True
+                self.last_decision_info[sector] = info
+                logger.debug("Dqn.act: buffer < sequence length, choosing random action")
+                continue
+            logger.debug("Dqn.act: choosing model based action")
 
             # One hot encoding -> action index
             with torch.no_grad():
-                actions[sector] = int(network(state).argmax(1).item())
+                q = network(state)
+                actions[sector] = int(q.argmax(1).item())
+            info["q_values"] = q.squeeze(0).cpu().numpy()
+            self.last_decision_info[sector] = info
 
         logger.function("Dqn.act end")
         return actions
 
-    def observe(self, observations, actions, rewards, next_observations, terminal, mask=None):
-        logger.function("Dqn.observe start: terminal=%s", terminal)
+    def observe(self, observations, actions, rewards, next_observations, terminal, mask=None, training=True):
+        logger.function("Dqn.observe start: terminal=%s training=%s", terminal, training)
         num_trained = 0
         num_synced = 0
 
@@ -217,16 +243,22 @@ class Dqn(TiltPolicy):
             if mask is not None and not mask[sector]:
                 continue  # not a real transition -- discard rather than learn from it
 
-            # Update training step
-            self.sector_decision_intervals[sector] += 1
-            logger.debug("Dqn.observe: sector=%d decision_interval=%d",
-                        sector, self.sector_decision_intervals[sector])
-
-            # Update replay buffer
+            # Update replay buffer -- unconditional, even if training=False,
+            # so a stretch of eval/warm-up calls still keeps the wesn
+            # model's own windowed history (buffer.recent(), see act())
+            # current instead of stale once training resumes.
             buffer.add(observations[sector], actions[sector], rewards[sector],
                       next_observations[sector], float(terminal))
             logger.debug("Dqn.observe: Observation: %s, Action: %s, Reward: %s, Next Observation: %s",
                         observations[sector], actions[sector], rewards[sector], next_observations[sector])
+
+            if not training:
+                continue  # state recorded above; no learning/counters below
+
+            # Update training step
+            self.sector_decision_intervals[sector] += 1
+            logger.debug("Dqn.observe: sector=%d decision_interval=%d",
+                        sector, self.sector_decision_intervals[sector])
 
             # Run training
             min_buffer = self.batch_size + (self.sequence_length - 1 if self.model == "wesn" else 0)
@@ -294,6 +326,7 @@ class Dqn(TiltPolicy):
 
         # Update loss
         self.step_losses.append(loss.item())
+        self.step_loss_sectors.append(sector)
         logger.function("Dqn._learn end: sector=%d loss=%.4f", sector, loss.item())
 
     def save(self, path):

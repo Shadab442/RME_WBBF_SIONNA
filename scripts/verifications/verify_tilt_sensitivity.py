@@ -55,7 +55,7 @@ sionna.phy.config.precision = "single"
 sionna.phy.config.device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
-def evaluate_flip_rates(engine: SimulationEngine, ut_height: float) -> np.ndarray:
+def evaluate_flip_rates(engine: SimulationEngine) -> np.ndarray:
     """[num_bs, num_grid_cells] flip rate -- fraction of N_REALIZATIONS
     independent shadow-fading draws in which the coverage outcome at that
     grid cell differs somewhere across engine.downtilt_sweep_deg, sweeping
@@ -70,7 +70,7 @@ def evaluate_flip_rates(engine: SimulationEngine, ut_height: float) -> np.ndarra
     def draw_outcomes(points_xy: np.ndarray, sector_i: int) -> np.ndarray:
         """[num_tilts, n_points] covered/not, one fresh channel draw."""
         n = points_xy.shape[0]
-        z = torch.full((n, 1), ut_height, dtype=dtype, device=device)
+        z = torch.full((n, 1), engine.ut_height, dtype=dtype, device=device)
         xy = torch.as_tensor(points_xy, dtype=dtype, device=device)
         ut_loc = torch.cat([xy, z], dim=-1).unsqueeze(0)
         ut_orient = torch.zeros(1, n, 3, dtype=dtype, device=device)
@@ -110,7 +110,7 @@ def main():
          f"candidate tilts={engine.downtilt_sweep_deg.tolist()} deg, "
          f"other sectors held at {BASELINE_OTHER_TILT_DEG} deg, N={N_REALIZATIONS} draws/cell")
 
-    flip_rates = evaluate_flip_rates(engine, cfg["topology"]["ut_height"])  # [num_bs, num_grid_cells]
+    flip_rates = evaluate_flip_rates(engine)  # [num_bs, num_grid_cells]
 
     counts_per_threshold = {tau: (flip_rates >= tau if tau > 0 else flip_rates > 0).sum(axis=1)
                             for tau in FLIP_RATE_THRESHOLDS}

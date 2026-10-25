@@ -3,31 +3,26 @@
 Every controller here derives from ``TiltController`` (right below): pick a
 starting tilt (``initial_select``), then advance it interval over interval
 (``update``). Each subclass's own initial_select()/update() parameter list
-reflects what THAT controller actually needs -- a coverage search needs a
-power table, Adaptive Legacy needs raw geometry+power, RL needs
-observations+reward -- deliberately not forced to a common signature, since
-those inputs differ in KIND, not just naming; what's shared is the lifecycle
-contract (these two method names) and, for each, a single persistent
-per-sector tilt state advanced by ``update``.
+reflects what THAT controller actually needs -- Adaptive Legacy needs raw
+geometry+power, RL needs observations+reward -- deliberately not forced to
+a common signature, since those inputs differ in KIND, not just naming;
+what's shared is the lifecycle contract (these two method names) and, for
+each, a single persistent per-sector tilt state advanced by ``update``.
 
-Three families implement it:
+Exactly two algorithms exist in this codebase (2026-09-22 -- Dynamic Local
+Causal, No Tilt, and both the old coordinate-ascent Oracle AND its CP-SAT
+replacement are all deleted; CP-SAT wasn't earning its own real-world cost
+relative to the baseline pipeline, so it was dropped rather than kept as a
+fourth comparison method. Nothing else is kept):
 
 * ``AdaptiveLegacyTiltController``: Reactive rule-based per-sector RET
   controller, scored at the current tilt and updated once per interval
   using measurements pooled over that interval.
 
-* ``SearchTiltController`` (``StaticTiltController``/``DynamicTiltController``):
-  given a power table, pick a per-sector tilt assignment maximizing pooled
-  coverage -- once and frozen (Static) or every interval, warm-started from
-  the previous pick (Dynamic).
-
-* ``RLTiltController``: Independent per-sector RL based tilt controller,
+* ``RLTiltController``: Independent per-sector RL based tilt controller
+  (DQN, or RandomPolicy for the untrained baseline -- see drl/factory.py),
   scored at the current tilt and updated from pooled measurements to
   select tilts for the next interval.
-
-``GlobalTiltSelector``/``LocalTiltSelector`` are NOT controllers -- they're
-the stateless search algorithms a ``SearchTiltController`` wraps and owns
-(the Strategy to its Context); they never hold tilt state themselves.
 """
 
 import numpy as np
@@ -72,9 +67,18 @@ class AdaptiveLegacyTiltController(TiltController):
 
     * downtilt if overshoot is high and edge coverage is acceptable;
     * uptilt if edge coverage is poor and overshoot is acceptable;
-    * otherwise hold the current tilt.
+    * otherwise hold the current tilt -- UNLESS both indicators are flagged
+      simultaneously, in which case the tilt moves toward whichever
+      indicator is proportionally further past its own threshold (severity
+      = value / threshold), rather than holding. A pure hold on "both
+      flagged" was found (2026-09-22) to deadlock the controller
+      permanently at its initial tilt whenever the two thresholds are not
+      both loose enough for some tilt to clear coverage_problem before
+      interference_problem does on the way up from theta_min -- exactly the
+      failure mode observed under the current network config, where
+      coverage_problem was structurally true across the entire tilt sweep.
 
-    No fuzzy membership functions or defuzzification are used in Threshold 
+    No fuzzy membership functions or defuzzification are used in Threshold
     comparisons. No overlap indicators.
 
     :ivar tilt_deg: [num_sectors] current tilt per sector.
@@ -155,11 +159,20 @@ class AdaptiveLegacyTiltController(TiltController):
         logger.debug("AdaptiveLegacyTiltController.update: interference_problem=%d coverage_problem=%d sectors",
                     int(interference_problem.sum()), int(coverage_problem.sum()))
 
+        # Both flagged at once: act on whichever is proportionally further
+        # past its own threshold instead of holding (a hold here can
+        # deadlock the tilt permanently -- see class docstring).
+        both_problems = interference_problem & coverage_problem
+        os_severity = n_os / self.os_threshold
+        bc_severity = r_bc / self.bc_threshold
+        tiebreak_downtilt = both_problems & (os_severity >= bc_severity)
+        tiebreak_uptilt = both_problems & (os_severity < bc_severity)
+
         # Increasing downtilt solves overshoot
-        increase_downtilt = interference_problem & ~coverage_problem
+        increase_downtilt = (interference_problem & ~coverage_problem) | tiebreak_downtilt
 
         # Decreasing downtilt solves coverage
-        decrease_downtilt = coverage_problem & ~interference_problem
+        decrease_downtilt = (coverage_problem & ~interference_problem) | tiebreak_uptilt
 
         # Final tilt
         delta_tilt = increase_downtilt * self.tilt_step_deg + decrease_downtilt * (-self.tilt_step_deg)
@@ -175,141 +188,6 @@ class AdaptiveLegacyTiltController(TiltController):
 
         logger.function("AdaptiveLegacyTiltController.update end")
         return self.tilt_deg
-
-
-class GlobalTiltSelector:
-    """Picks the single common tilt (same index applied to every sector)
-    that maximizes pooled coverage -- exhaustive search over every tilt in
-    the power table.
-    """
-
-    def select(self, kpi_manager, power_table: np.ndarray, threshold_db: float, warm_start=None) -> np.ndarray:
-        logger.function("GlobalTiltSelector.select start")
-        num_tilts, num_sectors = power_table.shape[0], power_table.shape[2]
-        coverages = np.array([
-            kpi_manager.compute_ue_kpis(power_table, np.full(num_sectors, t, dtype=int), threshold_db)["coverage"]
-            for t in range(num_tilts)
-        ])
-        logger.debug("GlobalTiltSelector.select: coverages=%s", coverages.tolist())
-
-        # Best global tilt
-        best_t = int(np.argmax(coverages))
-        logger.function("GlobalTiltSelector.select end: best_t=%d", best_t)
-        return np.full(num_sectors, best_t, dtype=int)
-
-
-class LocalTiltSelector:
-    """Selects per-sector tilts via coordinate ascent. Each sector sequentially 
-    chooses the candidate tilt that maximizes total network coverage given the 
-    current tilts of all other sectors. The process stops when a full round makes 
-    no changes, yielding a local optimum of the coupled non-convex problem.
-
-    :ivar last_num_rounds: rounds run by the most recent ``select()`` call.
-    :ivar last_coverage_trace: that call's pooled coverage per round
-        (element 0 is the starting coverage) -- e.g. for a convergence plot.
-    """
-
-    def __init__(self, max_rounds: int = 20):
-        self.max_rounds = max_rounds
-        self.last_num_rounds = None
-        self.last_coverage_trace = None
-
-    def select(self, kpi_manager, power_table: np.ndarray, threshold_db: float, warm_start=None) -> np.ndarray:
-        logger.function("LocalTiltSelector.select start: max_rounds=%d", self.max_rounds)
-        num_tilts, num_sectors = power_table.shape[0], power_table.shape[2]
-        if warm_start is None:
-            warm_start = GlobalTiltSelector().select(kpi_manager, power_table, threshold_db)
-        assignment = np.array(warm_start, dtype=int).copy()
-
-        coverage_trace = [kpi_manager.compute_ue_kpis(power_table, assignment, threshold_db)["coverage"]]
-
-        # Coverage ascent algorithm
-        num_rounds_run = 0
-        for round_idx in range(self.max_rounds):
-            num_rounds_run = round_idx + 1
-            changed = False
-            for s in range(num_sectors):
-                trial_coverages = np.empty(num_tilts)
-                for t in range(num_tilts):
-                    trial = assignment.copy()
-                    trial[s] = t
-                    trial_coverages[t] = kpi_manager.compute_ue_kpis(power_table, trial, threshold_db)["coverage"]
-                best_t = int(np.argmax(trial_coverages))
-                if best_t != assignment[s]:
-                    assignment[s] = best_t
-                    changed = True
-            coverage_trace.append(
-                kpi_manager.compute_ue_kpis(power_table, assignment, threshold_db)["coverage"])
-            if not changed:
-                break
-
-        self.last_num_rounds = num_rounds_run
-        self.last_coverage_trace = np.array(coverage_trace)
-        converged = num_rounds_run < self.max_rounds
-        logger.debug("LocalTiltSelector.select: num_rounds_run=%d converged=%s", num_rounds_run, converged)
-        if not converged:
-            logger.warning("LocalTiltSelector.select: did not converge within max_rounds=%d", self.max_rounds)
-        logger.function("LocalTiltSelector.select end")
-        return assignment
-
-
-class SearchTiltController(TiltController):
-    """Base for controllers that wrap a coverage-search selector (the
-    Strategy) and own the persistent per-sector assignment across
-    intervals (the Context) -- GlobalTiltSelector/LocalTiltSelector never
-    hold tilt state themselves, only this class and its subclasses do.
-    initial_select() picks the starting assignment; update() advances it
-    from there (and falls back to initial_select() itself if called
-    first, so callers can just call update() every interval, first one
-    included).
-    """
-
-    def __init__(self, selector):
-        self.selector = selector
-        self.assignment = None
-
-    def initial_select(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
-        logger.function("SearchTiltController.initial_select start")
-        self.assignment = self.selector.select(kpi_manager, power_table, threshold_db)
-        logger.function("SearchTiltController.initial_select end")
-        return self.assignment
-
-    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
-        raise NotImplementedError
-
-
-class StaticTiltController(SearchTiltController):
-    """Calibrates ONCE (initial_select), freezes that result for every
-    later update() -- e.g. Static Global / Static Local, a one-time
-    calibration (like a drive test).
-    """
-
-    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
-        logger.function("StaticTiltController.update start")
-        if self.assignment is None:
-            logger.debug("StaticTiltController.update: no assignment yet, calibrating")
-            result = self.initial_select(kpi_manager, power_table, threshold_db)
-        else:
-            result = self.assignment
-        logger.function("StaticTiltController.update end")
-        return result
-
-
-class DynamicTiltController(SearchTiltController):
-    """Recomputes on every update() call, warm-started from its own
-    previous assignment -- e.g. Dynamic Global / Dynamic Local.
-    """
-
-    def update(self, kpi_manager, power_table: np.ndarray, threshold_db: float) -> np.ndarray:
-        logger.function("DynamicTiltController.update start")
-        if self.assignment is None:
-            result = self.initial_select(kpi_manager, power_table, threshold_db)
-        else:
-            self.assignment = self.selector.select(kpi_manager, power_table, threshold_db,
-                                                    warm_start=self.assignment)
-            result = self.assignment
-        logger.function("DynamicTiltController.update end")
-        return result
 
 
 class RLTiltController(TiltController):
@@ -340,49 +218,85 @@ class RLTiltController(TiltController):
         """The starting tilt INDEX"""
         return self.tilt_idx
 
-    def update(self, observations: np.ndarray, rewards: np.ndarray, training: bool,
-              has_data: np.ndarray = None, schedule: np.ndarray = None,
-              terminal: bool = False) -> np.ndarray:
-        """
+    def learn(self, observations: np.ndarray, rewards: np.ndarray, training: bool,
+             has_data: np.ndarray = None, schedule: np.ndarray = None, terminal: bool = False) -> None:
+        """Stores the transition (self._prev_observations/_prev_actions --
+        this sector's own previously stored action -- -> rewards/
+        observations) for scheduled+valid sectors. Does NOT pick a new
+        action -- call decide() separately for that (update() below fuses
+        both, in that order, for the ordinary "next_state" convention).
+
         :param observations: [num_sectors, num_features] dense array, OR --
             if variable_size -- a [num_sectors] list of per-sector 1D
-            arrays (possibly different widths). Only entries for scheduled
-            sectors need be meaningful this call.
+            arrays (possibly different widths). This is the RESULT
+            observation the stored transition's reward/outcome corresponds
+            to -- under "current_state" reward timing this is NOT
+            necessarily the same array passed to the decide() call that
+            picked the action being credited.
         :param rewards: [num_sectors], only meaningful for scheduled
             sectors -- reward from each scheduled sector's own previously
             stored action.
         :param training: if True, learn from each scheduled sector's
-            completed transition and explore; if False, act greedily and
-            don't learn.
+            completed transition; if False, don't learn (still called
+            every interval regardless -- see RLTiltController.update's own
+            docstring for why "record but don't train" still matters for a
+            policy with recurrent/windowed state).
         :param has_data: [num_sectors] bool, optional -- False marks a
             sector with no real observation this call. A transition is
             added to experience only if both the state it started from
             (this sector's own last-stored validity) and the outcome it
             produced (this call's has_data) had real data.
         :param schedule: [num_sectors] bool, optional -- False means this
-            sector's window hasn't closed yet this call; it holds
-            ``self.tilt_idx`` unchanged and its stored previous-state is
-            left untouched. A scheduled sector with no data (has_data
-            False) also holds its previous tilt -- same fallback as "not
-            scheduled", just for a different reason (nothing meaningful to
-            decide from, rather than not yet due).
+            sector's window hasn't closed yet this call; nothing is
+            recorded for it.
         """
-        logger.function("RLTiltController.update start: training=%s terminal=%s", training, terminal)
+        logger.function("RLTiltController.learn start: training=%s terminal=%s", training, terminal)
         num_sectors = len(observations)
         if has_data is None:
             has_data = np.ones(num_sectors, dtype=bool)
         if schedule is None:
             schedule = np.ones(num_sectors, dtype=bool)
-        logger.debug("RLTiltController.update: scheduled=%d/%d has_data=%d/%d",
-                    int(schedule.sum()), num_sectors, int(has_data.sum()), num_sectors)
 
-        if training and self._prev_observations is not None and schedule.any():
+        if self._prev_observations is not None and schedule.any():
             transition_valid = schedule & self._prev_valid & has_data
             if transition_valid.any():
                 self.policy.observe(self._prev_observations, self._prev_actions, rewards,
-                                   observations, terminal, mask=transition_valid)
-                logger.debug("RLTiltController.update: observed %d valid transitions",
-                            int(transition_valid.sum()))
+                                   observations, terminal, mask=transition_valid, training=training)
+                logger.debug("RLTiltController.learn: observed %d valid transitions (training=%s)",
+                            int(transition_valid.sum()), training)
+        logger.function("RLTiltController.learn end")
+
+    def decide(self, observations: np.ndarray, training: bool,
+              has_data: np.ndarray = None, schedule: np.ndarray = None) -> np.ndarray:
+        """Picks a new tilt from `observations` for scheduled+has_data
+        sectors (every other sector holds its previous tilt), and caches
+        (observations, action, has_data) as this sector's own
+        "previously stored action" for the NEXT learn() call to credit.
+        Does NOT store a training transition itself -- call learn()
+        separately for that.
+
+        :param observations: [num_sectors, num_features] dense array, OR --
+            if variable_size -- a [num_sectors] list of per-sector 1D
+            arrays. This is the DECISION input -- under "current_state"
+            reward timing, a forecast of the CURRENT interval (e.g.
+            predicted occupancy), not necessarily the same array learn()
+            is later called with.
+        :param has_data: [num_sectors] bool, optional -- False marks a
+            sector with no real observation this call; it holds its
+            previous tilt, same fallback as "not scheduled".
+        :param schedule: [num_sectors] bool, optional -- False means this
+            sector's window hasn't closed yet this call; it holds
+            ``self.tilt_idx`` unchanged and its stored previous-state is
+            left untouched.
+        """
+        logger.function("RLTiltController.decide start: training=%s", training)
+        num_sectors = len(observations)
+        if has_data is None:
+            has_data = np.ones(num_sectors, dtype=bool)
+        if schedule is None:
+            schedule = np.ones(num_sectors, dtype=bool)
+        logger.debug("RLTiltController.decide: scheduled=%d/%d has_data=%d/%d",
+                    int(schedule.sum()), num_sectors, int(has_data.sum()), num_sectors)
 
         # Only a scheduled sector with real data gets to pick a new tilt;
         # every other masked sector (not yet scheduled, OR scheduled but
@@ -404,5 +318,20 @@ class RLTiltController(TiltController):
         self._prev_valid[schedule] = has_data[schedule]
         self.tilt_idx[schedule] = actions[schedule]
 
-        logger.function("RLTiltController.update end")
+        logger.function("RLTiltController.decide end")
         return self.tilt_idx
+
+    def update(self, observations: np.ndarray, rewards: np.ndarray, training: bool,
+              has_data: np.ndarray = None, schedule: np.ndarray = None,
+              terminal: bool = False) -> np.ndarray:
+        """The ordinary "next_state" convention, fused: learn() from the
+        PREVIOUS action using `observations`/`rewards`, THEN decide() the
+        NEXT action from that SAME `observations` array -- i.e. reward is
+        credited to the previous action, and the same measurement that
+        confirmed it also becomes the input for what comes next. See
+        decide()/learn()'s own docstrings for the split, "current_state"-
+        reward-timing version, where the two calls use DIFFERENT
+        observation arrays and can happen in either order.
+        """
+        self.learn(observations, rewards, training, has_data, schedule, terminal)
+        return self.decide(observations, training, has_data, schedule)

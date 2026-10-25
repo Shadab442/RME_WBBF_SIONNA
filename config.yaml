@@ -1,173 +1,373 @@
 topology:
   scenario: uma
   num_rings: 1
-  num_ut: 300
+  spatial_grid_cell_size_m: 10.0
+  num_ut: 600
+  # TODO: real 3GPP TR 38.901 UMa/UMi indoor UEs vary height by floor
+  # (h_UT = 3*(n_fl-1) + 1.5, n_fl ~ U[1, N_fl], N_fl ~ U[4,8]), not one
+  # flat height for every UE -- revisit later.
   ut_height: 1.5                # m
+  # Indoor/outdoor & anchor/ non-anchor split is per CLUSTER
+  # outdoor_ue_ratio_override: null (default) uses the scenario's 3GPP default
+  # set to a number here to override it instead.
+  outdoor_ue_ratio_override: null
+  # Anchor (location-known) conditioned on cluster's own indoor/outdoor status
+  # (indoor/outdoor itself is an ordinary per-cluster-slot draw, fixed for
+  # the whole run -- NOT region-type-dependent; mid gets no special
+  # treatment here, only in anchor_selection_mode below).
+  # outdoor_gnss_prob=1.0 + indoor_gnss_prob=0.0 (2026-10-23) -- every outdoor
+  # UE is anchor, no indoor UE is -- combined with the 80/20 indoor/outdoor
+  # split this gives ~20% anchor overall.
+  outdoor_gnss_prob: 1.0
+  indoor_gnss_prob: 0.0
+  # Which clusters become anchor, among those eligible by outdoor/indoor_
+  # gnss_prob above (2026-10-15). DYNAMIC for HotspotDemandMobility -- see
+  # SimulationEngine._redraw_location_reporting_mask's own comment --
+  # re-derived every hotspot transition, not fixed once for the run.
+  #   random      -- plain Bernoulli(p) over the whole cluster population,
+  #                  ignoring region type.
+  #   balanced    -- sector-wide target_total = round(p * total_clusters),
+  #                  water-filled one cluster at a time to whichever of
+  #                  near/mid/far currently has the fewest anchors, so the
+  #                  budget spreads as evenly as possible across all three.
+  #   mid_prioritized_balanced -- (2026-10-23) same sector-wide budget as
+  #                  "balanced", but mid clusters draw FIRST from it (up to
+  #                  min(mid_count, target_total)), then the remainder is
+  #                  water-filled across near/far only. With mid this small
+  #                  (1/sector) and target_total this large (~4), mid ends
+  #                  up anchor almost always, without inflating the overall
+  #                  anchor fraction past the real ~20% target the way an
+  #                  unconditional force would (see project history
+  #                  2026-10-23 for why unconditional forcing was rejected).
+  anchor_selection_mode: mid_prioritized_balanced   # "random" | "balanced" | "mid_prioritized_balanced"
+  # Near/mid/far hotspot region definition, used for BOTH where demand-state
+  # clusters get placed (hotspot_region_points) and how existing UEs get
+  # classified into occupancy/state (OccupancyEstimator/RegionalInfoProvider)
+  # -- both always read the SAME calibrated table, never two different
+  # definitions. "radial" (default): fixed radial-distance cuts from each
+  # cell to its own site. "sinr": each cell's own simulated SINR under a
+  # frozen reference condition (every sector at 9 deg tilt, forced LOS, no
+  # shadow fading -- independent of this run's own channel settings).
+  region_definition_method: radial   # "radial" | "sinr"
 
 antenna:
-  m: 8                          # vertical antenna elements per sector
-  antenna_window: rectangular
+  m: 32                      # vertical antenna elements per sector
+  antenna_window: hanning     # "rectangular" or "hanning" 
+  azimuth_offset_deg: 0.0
 
+# Symmetric around 0 (0 = boresight, + = down, - = up)
 downtilt:
-  downtilt_sweep_start_deg: 0
-  downtilt_sweep_end_deg: 12
-  tilt_step_deg: 4
-
+  downtilt_sweep_start_deg: 5
+  downtilt_sweep_end_deg: 13
+  tilt_step_deg: 1
+  
 channel:
   carrier_frequency: 3.5e+9     # Hz, n78 FR1 mid-band
-  bs_tx_power_dbm: 40.0
-  channel_bandwidth_prb: 50
-  temperature: 294.0            # K
+  bs_tx_power_dbm: 49.0
+  channel_bandwidth_prb: 20     # For noise power calculation within SSB PRBs
+  temperature: 290.0            # K
+  noise_figure_db: 9.0
+  # force_los: null follows 3GPP's stochastic per-link LOS/NLOS draw.
+  # true/false forces LOS/NLOS instead. true + disable_shadow_fading=true
+  # (LOS, no shadowing) is the new default for now (2026-10-11).
+  force_los: true
+  disable_shadow_fading: true
+  # sticky_los_enabled: Sionna's own stochastic LOS model (force_los: null)
+  # independently redraws every link's LOS/NLOS state every interval, even
+  # if a UE hasn't moved -- a real flip-flop artifact 3GPP TR 38.901 Sec
+  # 7.6.3 itself calls out and addresses via spatial correlation
+  # (confirmed: Sionna 2.0.0 ships the real Table 7.6.3.1-2-style corrDist
+  # numbers in its own RMa_O2I.json model data but never actually reads
+  # them anywhere -- no enable_spatial_consistency option exists in this
+  # version). true (2026-10-12, now the DEFAULT -- "sticky" is the actual
+  # stochastic LOS behavior, not an opt-in extra) holds each UE's LOS state
+  # fixed for as long as its own cluster is holding (mobility.ref_xy
+  # unchanged -- a member's own small within-cluster walk does NOT trigger
+  # a redraw), redrawing the whole cluster fresh only when it jumps to a
+  # new reference point (see helpers/sticky_los.py) -- a simple
+  # approximation, not the full spec procedure. false restores Sionna's own
+  # raw independent-redraw-every-interval behavior. Fully removable: delete
+  # this key + sticky_los.py + its one call site in
+  # SimulationEngine.step_environment.
+  sticky_los_enabled: true
 
 kpi:
   coverage_threshold_db: 0.0
+  # Minimum RSRP [dBm] from a UE's own serving sector (max-RSRP cell,
+  # i.e. best_power_db+30 -- same definition as an earlier DRL-tilt
+  # codebase's own rxPowerTh=-105) for that UE to count as "covered" --
+  # a UE must now clear BOTH this AND coverage_threshold_db's SINR gate.
+  # null disables the RSRP gate (SINR-only coverage, old behavior).
+  rsrp_threshold_dbm: -75.0
   sinr_percentiles: [50, 5]
+  ho_mode: a3_hysteresis   # "max_rsrp" | "a3_hysteresis"
+  a3_hysteresis_db: 1.0
 
 mobility:
-  min_ut_speed: 1.0             # m/s
-  max_ut_speed: 2.0             # m/s
-  num_groups: 60
-  deviation_radius_frac_area: 0.1
-  # Hard cap on cluster radius (deviation_radius) -- enforced at construction
-  # (SimulationEngine asserts deviation_radius <= this). Keeps EVERY member
-  # of a cluster centered anywhere at least min_bs_ut_dist + cluster_radius_max_m
-  # from a site outside the exclusion zone too, not just the cluster's own
-  # reference/waypoint point -- see helpers/mobility.py's "central" waypoint
-  # filtering and helpers/ue_drop.py's cluster_centers.
-  cluster_radius_max_m: 100.0
-  member_jitter_speed: 1.0      # m/s
-  # Cluster-CENTER mobility:
-  #   random   -- baseline: continuous random-waypoint walk (unbounded
-  #               destinations across the whole footprint).
-  #   periodic -- discrete hotspot transitions: holds at one of
-  #               num_waypoints predefined per-cluster hotspots (auto-
-  #               generated within one hex cell_radius of the cluster's own
-  #               starting site) for waypoint_hold_steps tilt control
-  #               intervals, then jumps cyclically (0->1->2->0->...).
-  #   markov   -- same discrete jumps, but the next waypoint is sampled
-  #               from waypoint_transition_matrix's row instead of cycling.
-  # Examples:
-  #   periodic + static UEs:      cluster_mobility_mode: periodic, intra_cluster_mobility: static
-  #   periodic + random-walk UEs: cluster_mobility_mode: periodic, intra_cluster_mobility: random_walk
-  #   markov + random-walk UEs:   cluster_mobility_mode: markov,   intra_cluster_mobility: random_walk
-  #   original random RPGM:       cluster_mobility_mode: random (waypoint_* keys unused)
-  cluster_mobility_mode: periodic   # "random" | "periodic" | "markov"
-  # transition: HOW the reference point gets from its current position to
-  # the next one, independent of cluster_mobility_mode above -- see
-  # helpers/mobility.py's class docstring.
-  #   jump   -- holds, then teleports instantly. "random" holds for a
-  #             random duration in [1, waypoint_hold_steps]; periodic/markov
-  #             hold for a fixed waypoint_hold_steps. (This class's
-  #             original periodic/markov behavior.)
-  #   smooth -- walks continuously instead of teleporting. "random" draws a
-  #             random speed in [min_ut_speed, max_ut_speed] each transition
-  #             (its original behavior) and departs again immediately on
-  #             arrival. periodic/markov instead take exactly ONE
-  #             tilt_control_interval_s per transition regardless of
-  #             distance (speed = distance / tilt_control_interval_s, not
-  #             random), and still dwell for waypoint_hold_steps at each
-  #             arrived-at waypoint first.
-  transition: smooth                  # "jump" | "smooth"
-  num_waypoints: 3                 # only used by periodic/markov
-  # In TILT CONTROL INTERVALS (3 * 300s = 15 min) -- used by periodic/markov
-  # (any transition), and by cluster_mobility_mode=random with
-  # transition=jump (there it bounds a random per-group dwell instead of
-  # being a fixed duration -- see transition's own comment above).
-  waypoint_hold_steps: 3
-  waypoint_transition_matrix:      # only used by markov; rows must sum to 1, size num_waypoints x num_waypoints
-    - [0.7, 0.2, 0.1]
-    - [0.2, 0.6, 0.2]
-    - [0.1, 0.2, 0.7]
-  # Waypoint candidate placement (periodic/markov only, ignored for "random"
-  # cluster_mobility_mode):
-  #   random  -- continuous random points within one hex cell_radius of the
-  #              cluster's own starting site.
-  #   central -- num_waypoints chosen at random (no replacement) from the
-  #              centroids of the cluster's home sector's 9 pooled
-  #              observation-window regions (center/edge/corner).
-  waypoint_type: central           # "random" | "central"
-  # Intra-cluster UE mobility:
-  #   random_walk -- baseline: small random drift from the cluster center,
-  #                  clamped to deviation_radius.
-  #   static      -- fixed relative offset from the cluster center; still
-  #                  moves WITH it (including across a periodic/markov jump).
-  intra_cluster_mobility: random_walk   # "random_walk" | "static"
+  # Shared by EVERY mobility mode 
+  common:
+    num_clusters_per_sector: 10
+    # num_ues_per_cluster: DERIVED (topology.num_ut // (num_bs *
+    # num_clusters_per_sector)), not set here -- see topology.num_ut's own
+    # comment.
+    # Per-step random-walk radius for a member's ffset from its group's 
+    # reference point, as a fraction of EACH mode's OWN deviation radius 
+    member_walk_step_frac: 0.15
+    # Cluster-CENTER mobility 
+    #   rpgm-random   -- (mobility.rpgm): holds for a random per-group
+    #               dwell (uniform in [1, waypoint_hold_steps]), then
+    #               teleports to a fresh random point across the whole
+    #               footprint.
+    #   rpgm-periodic -- (mobility.rpgm): holds at one of num_waypoints
+    #               predefined per-cluster hotspots for waypoint_hold_steps
+    #               tilt control intervals, then jumps cyclically
+    #               (0->1->2->0->...). Waypoint 0 is the cluster's own
+    #               starting position; the rest are auto-generated FRESH
+    #               points inside the cluster's home sector's near/mid/far
+    #               hotspot regions (cycling through all three, the SAME
+    #               UeDropper.hotspot_region_points machinery
+    #               hotspot_demand's own clusters use -- see
+    #               helpers/mobility.py).
+    #   rpgm-markov   -- (mobility.rpgm): same discrete jumps, but the next
+    #               waypoint is sampled from waypoint_transition_matrix's
+    #               row instead of cycling.
+    #   hotspot_demand-markov / hotspot_demand-periodic -- (mobility.hotspot):
+    #               num_clusters_per_sector clusters/sector cycle through
+    #               demand_states -- spatial demand states along the
+    #               near/mid/far split -- each sector via its OWN
+    #               independent Markov chain or deterministic cycle (not a
+    #               shared network-wide clock -- see transition_matrix
+    #               below for the markov submode), reshuffling which
+    #               cluster sits in which (sector, hotspot-type) slot --
+    #               allowed to move to an ADJACENT sector, not just its
+    #               own -- every transition.
+    cluster_mobility_mode: hotspot_demand-periodic
+    # "rpgm-random" | "rpgm-periodic" | "rpgm-markov" | "hotspot_demand-markov" | "hotspot_demand-periodic"
+
+  # Legacy ReferencePointGroupMobility modes only
+  rpgm:
+    deviation_radius_frac_area: 0.1
+    cluster_radius_max_m: 100.0
+    num_waypoints: 3                 # only used by rpgm-periodic/rpgm-markov
+    waypoint_hold_steps: 3
+    waypoint_transition_matrix:  # only used by markov; rows must sum to 1, size num_waypoints x num_waypoints
+      - [0.7, 0.2, 0.1]
+      - [0.2, 0.6, 0.2]
+      - [0.1, 0.2, 0.7]
+
+  # hotspot_demand only
+  hotspot:
+    # RADIAL semi-axis of each cluster's member-scatter ellipse -- the only
+    # axis near/mid/far region membership actually cares about (purely a
+    # radial-distance-from-site cutoff, see hotspot_region_membership).
+    # Shrunk from the old isotropic 40.0 (2026-10-22): UMa's mid/far bands
+    # are only ~56-59m wide, so a 40m-radius circular scatter routinely let
+    # members drift into a neighboring region -- empirically verified fully
+    # eliminated (0 mismatches/18000 checked) at radial=6.0/tangential=15.0,
+    # the smallest values tested; a tiny residual (~0.04%) persists below
+    # that, tied to specific sectors whose rhombus wedge is locally narrow
+    # near a region boundary, not a code bug -- see hotspot_region_points'
+    # own docstring.
+    deviation_radius_m: 6.0
+    # TANGENTIAL (azimuthal) semi-axis -- can stay much larger than the
+    # radial one since there's no region boundary in that direction, BUT
+    # not as large as the old isotropic 40.0: a too-wide tangential probe
+    # can still push hotspot_region_points' own clearance check outside a
+    # sector's rhombus wedge (a different failure mode from the radial
+    # near/mid/far crossing, discovered while tuning this). None (default,
+    # omit this key): falls back to deviation_radius_m, i.e. a circle.
+    deviation_radius_tangential_m: 15.0
+    hotspot_hold_steps: 3
+    # [n_near, n_mid, n_far] per sector
+    # One dedicated "heavy" state per region, each row sums to
+    # num_clusters_per_sector=10. MIXED (2026-10-15 new default, replacing
+    # the earlier pure 10:0:0 rows) -- every row keeps at least 1 cluster
+    # in EVERY region, so no region is ever completely cluster-free at any
+    # point in the run. Needed for anchor_selection_mode="balanced" below
+    # to be able to guarantee at least one anchor cluster per region at all
+    # times -- impossible under a pure 10:0:0 row, since the other two
+    # regions would hold zero clusters whenever that state is active.
+    demand_states:
+      - [5, 1, 4]  # Balanced -- replaces Mid-heavy (2026-10-23): with
+                   # anchor_selection_mode="mid_prioritized_balanced", mid clusters
+                   # draw anchor status first every sector, so keeping mid's count
+                   # minimal here keeps the near/far split close to the demand split.
+                   # Halved from [10,1,9] (2026-10-24) to match num_ut/
+                   # num_clusters_per_sector both halved for GPU memory -- same
+                   # near:mid:far ratio, UEs/cluster unchanged.
+      - [8, 1, 1]  # Near-heavy -- halved from [18,1,1]
+      - [1, 1, 8]  # Far-heavy -- halved from [1,1,18]
+    # How each sector's OWN state advances every hotspot_hold_steps
+    # intervals, independently per sector (never one shared network-wide
+    # clock -- see class history in helpers/mobility.py). Picked via
+    # mobility.common.cluster_mobility_mode's own submode now (2026-10-01,
+    # "hotspot_demand-markov" | "hotspot_demand-periodic" -- see that key's
+    # own comment), not a separate key here:
+    #   markov   -- sector s's next state is sampled from
+    #               transition_matrix[s's current state index]. Genuinely
+    #               random per sector.
+    #   periodic -- deterministic +1 mod num_states per sector. Each
+    #               sector's STARTING state is already an independent
+    #               random draw, so sectors stay at a fixed offset from
+    #               each other forever rather than resynchronizing --
+    #               fully reproducible per sector, useful for controlled
+    #               comparisons (e.g. two tilt controllers scored against
+    #               the IDENTICAL demand trajectory) at the cost of a less
+    #               organic-looking pattern than "markov".
+    # [num_states, num_states] row-stochastic -- markov only, ignored for
+    # periodic. Left unset -> uniform default (every state equally likely
+    # regardless of current state), which already desynchronizes sectors
+    # from each other with no extra tuning.
+    # transition_matrix:
+    #   - [0.333, 0.333, 0.334]
+    #   - [0.333, 0.333, 0.334]
+    #   - [0.333, 0.333, 0.334]
+    #
+    # sector_bias: [num_bs] per-sector home-state index (null = off, uses
+    # transition_matrix above). Home state gets sector_bias_strength
+    # probability, others split evenly. Below: far(2)/mid(0) alternating.
+    sector_bias: [2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2, 0, 2]
+    sector_bias_strength: 0.7
 
 simulation:
-  measurement_interval_s: 1.0
-  tilt_control_interval_s: 300.0
-  num_tilt_control_intervals: 1200
+  num_tilt_control_intervals: 1000
   steady_state_episodes: 50
-  num_realizations_per_slot: 1
   environment_seed: 1
-  max_realization_cuda: 1
 
 algorithms:
-  optimization:
-    enabled: true
-    coordinate_ascent_max_rounds: 20
-    run_causal: false # Dynamic Local Causal is skipped by default 
-
   adaptive_legacy:
     overlap_margin_db: 3.0
-    edge_percentile: 95.0
-    os_threshold: 0.006
-    bc_threshold: 0.33
+    edge_percentile: 85.0
+    os_threshold: 0.05
+    bc_threshold: 0.85
   
   drl:
-    policy_name: dqn     # or "random"
+    policy_name: dqn     # "dqn" | "random" | "ppo"
     algorithm_seed: 1
-    # state_type: "region_aligned" -- own tilt + own (occupancy, coverage)
-    #     over a FIXED set of regions formed by pooling the sector's own
-    #     rhombus fine-grid into region_block_size x region_block_size
-    #     blocks (identical region count/geometry for every sector, no
-    #     search needed) + each of up to 4 SEPARATE side-sharing neighbors'
-    #     own tilt + one COARSE (whole-sector occupancy, whole-sector
-    #     coverage) pair -- see helpers/regional_info_provider.py.
-    state_type: region_aligned
-    # Block-pool size for region_aligned's own-region tiling -- must evenly
-    # divide grid_n (the rhombus fine-grid side length; see
-    # spatial_grid_cell_size_m below). num_own_regions = (grid_n /
-    # region_block_size)^2, e.g. grid_n=6, region_block_size=2 -> 9 regions.
-    region_block_size: 2
-    # region_aligned only -- how a sector with fewer than 4 neighbors is
-    # sized (only the neighbor portion varies; the own-region portion is
-    # always num_own_regions wide):
-    #   "variable" -- that sector's real width (fewer neighbor slots) -- no
-    #                 representational ambiguity between "no neighbor here"
-    #                 and "a real all-zero neighbor"/"a real neighbor at
-    #                 0 deg", but each sector's network then has its own
-    #                 input width (fine here since Dqn never shares
-    #                 parameters across sectors).
-    #   "zero"      -- neighbor portion always zero-filled up to 4 slots.
-    state_padding: variable
-    # Grid cell size [m] for the per-sector rhombus grid -- feeds
-    # region_aligned's block pooling and the "central" waypoint mode's
-    # region centroids -- landed on UMa's shadow-fading decorrelation
-    # distance range.
-    spatial_grid_cell_size_m: 50.0
-    # EMA smoothing weight on each window's new occupancy observation (in
-    # (0, 1]) -- rho_x[k] = alpha*rho_tilde_x[k] + (1-alpha)*rho_x[k-1].
-    # Starting point, not yet empirically tuned.
-    occupancy_ema_alpha: 0.5
-    # coverage_fill: how a region's coverage is computed at the fine
-    # (spatial_grid_cell_size_m) grid cells within it that had no UE this
-    # window.
-    #   zero   -- 0.0 (validated design, see helpers/regional_info_provider.py).
-    #   kriged -- Krige each sector's own RSRP [dB] map (algorithm/kriging.py),
-    #             reconstruct SINR from ALL sectors' predictions, threshold
-    #             -- SpatialGridEstimator's rsrp_per_sector method, reused
-    #             here and aggregated per region.
-    coverage_fill: kriged
-    # reward_type: "sector_neighbors" -- mean coverage pooled over the
-    #     sector's own FULL area plus its (2-4) side-sharing neighbors'
-    #     FULL areas (not just their boundary-adjacent cells) -- see
+    # state_type: "region_aligned" -- own tilt + own (occupancy, SINR
+    #     p25/p50/p75) pooled over the near/mid/far hotspot regions (see
+    #     OccupancyEstimator's own SEPARATE index-based region rule --
+    #     NOT the same one hotspot_region_membership/mobility uses as of
+    #     2026-09-22) + one coarse (occupancy, median SINR) pair from
+    #     exactly the 2 real cross-site front neighbors -- see
+    #     drl/interface.py's compute_region_state and
     #     helpers/regional_info_provider.py.
-    reward_type: sector_neighbors
-    # Decentralized setup -> async per-sector updates. "async" colors
-    # sector_adjacency (Welsh-Powell) so two ADJACENT sectors never decide
-    # in the same window -- the actual requirement, not "every sector gets
-    # a unique offset". "sync": every sector decides together (offset 0).
+    #     "cell_aligned" (2026-09-22 addition, tested ALONGSIDE
+    #     region_aligned, not replacing it) -- own tilt + own (occupancy,
+    #     median SINR) at EVERY one of a sector's own individual fine-grid
+    #     cells (no region pooling at all -- see
+    #     helpers/cell_aligned_info_provider.py's own module docstring for
+    #     why: region-pooling can conflate cells with OPPOSITE
+    #     tilt-sensitivity, e.g. a near-BS boundary cell that gains
+    #     coverage under downtilt and a far-from-BS boundary cell that
+    #     loses it under the SAME downtilt, both landing in the same
+    #     region) + the same 2-real-neighbor coarse (occupancy, median
+    #     SINR) pair as region_aligned (no neighbor tilt though -- see
+    #     drl/interface.py's compute_cell_state). 35 valid cells x 2 stats
+    #     + 1 own tilt + 2 neighbors x 2 stats = 75 features at this
+    #     codebase's current grid resolution.
+    #     "polar_whole_neighbor" (2026-10-15 addition) -- own tilt + own
+    #     (occupancy, SINR p25/p50/p75) pooled over a POLAR grid (radial
+    #     near/mid/far x polar_num_azimuthal angular bins, see
+    #     helpers/simulation_engine.py's own _calibrate_polar_lut) instead
+    #     of plain near/mid/far, + the SAME whole-sector-scalar 2-neighbor
+    #     pair as region_aligned (reuses compute_region_state as-is, its
+    #     own "own" block is shape-generic).
+    #     "polar_region_neighbor" (2026-10-15 addition) -- same own polar
+    #     grid as polar_whole_neighbor, but each of the 2 real neighbors'
+    #     own near/mid/far breakdown (occupancy[3]+sinr_p50[3]+tilt[1] = 7
+    #     features/neighbor) is exposed instead of one whole-sector scalar
+    #     -- see drl/interface.py's compute_polar_regional_neighbor_state.
+    state_type: region_aligned   # "region_aligned" | "cell_aligned" | "polar_whole_neighbor" | "polar_region_neighbor"
+    # polar_num_azimuthal: angular bin count for polar_whole_neighbor/
+    # polar_region_neighbor's own radial x azimuthal grid (3 radial x this
+    # many azimuthal = total own-sector bins). Ignored by every other
+    # state_type.
+    polar_num_azimuthal: 5
+    # location_reporting_fraction/location_reporting_mode: REPLACED
+    # (2026-10-10) by channel.outdoor_gnss_prob/indoor_gnss_prob -- anchor
+    # status is now a per-cluster Bernoulli draw conditioned on that
+    # cluster's own indoor/outdoor status (see channel section), not a flat
+    # fraction. Own-region state (own_occupancy/own_coverage) for a
+    # non-anchor UE is still INFERRED (see region_inference_sigma_db below)
+    # rather than known.
+    # Gaussian-kernel bandwidth [dB] for inferring a non-anchor UE's own
+    # region: compares its own real measured RSRP against a Kriging field
+    # fit ONLY from anchor UEs' own (location, RSRP) pairs this interval,
+    # over its serving sector's fine grid, converts the match into a
+    # probability per region (SpatialGridEstimator.
+    # infer_region_probabilities), then HARD-assigns the region via
+    # argmax(region_probs) -- the non-anchor UE is then counted as one full
+    # unit in that single inferred region for BOTH own_occupancy and
+    # own_coverage, exactly like an anchor UE's own known region (no
+    # fractional/probabilistic splitting across regions). Calibrated
+    # empirically against this scenario's own ground truth (compare
+    # argmax(region_probs) to each UE's REAL region -- only possible as a
+    # research check, never inside production code, which never gets to
+    # see a non-anchor UE's real region): accuracy plateaus around 83-84%
+    # for sigma in [0.1, 1.5] (peak ~84.1% at 0.75, used here), well above
+    # the 43.6% majority-class baseline -- confirming the RSRP fingerprint
+    # carries real signal, not just reflecting a skewed region
+    # distribution. That 84% is NOT uniform across regions, though: near=
+    # 85%, far=99%, but mid=31% recall -- "mid" is a geometrically narrow
+    # band whose radio signature genuinely overlaps near/far, so its own
+    # hard assignment is the least reliable of the three.
+    region_inference_sigma_db: 0.75
+    # non_anchor_region_handling: how a non-anchor UE's own region is
+    # decided for own_occupancy/own_coverage/own_sinr_* (own-region STATE
+    # only -- reward and whole-sector coarse state always count every
+    # real UE regardless, see RegionalInfoProvider.accumulate's own
+    # docstring).
+    #   exclude -- (default, 2026-09-20) a non-anchor UE simply isn't
+    #              counted in the own-region breakdown at all. No
+    #              inference of any kind.
+    #   rme     -- infer via SpatialGridEstimator.infer_region_probabilities
+    #              (Kriging fit from anchor UEs only) then
+    #              argmax(region_probs), same one-full-unit hard
+    #              assignment as an anchor UE's own real region. NOT
+    #              CURRENTLY RECOMMENDED: phase 5's own kriging_hard/soft
+    #              situations found this makes region estimates WORSE than
+    #              "exclude" (systematically over-assigns UEs to "far") --
+    #              kept switchable for after region_inference_sigma_db
+    #              gets recalibrated against the current geometry (see
+    #              region_inference_sigma_db's own comment above).
+    #   radio_map -- (2026-10-23) pairs with topology.anchor_selection_mode=
+    #              "mid_prioritized_balanced", which gives mid clusters first
+    #              claim on each sector's anchor budget, so a non-anchor UE
+    #              is near-always near or far, essentially never mid. Builds
+    #              each sector's near/far RSRP+SINR mean/std from EVERY UE
+    #              this turn (full simulator ground-truth access, not
+    #              anchor-limited -- a deliberately idealized "radio map
+    #              given directly by the simulator", not a deployment-
+    #              realistic estimate like "rme" above), then assigns each
+    #              non-anchor UE to whichever of near/far minimizes
+    #              standardized distance (z_rsrp^2 + z_sinr^2). Validated
+    #              offline at ~95-96% accuracy on this exact near/far split
+    #              (SimulationEngine._build_region_idx_radio_map).
+    non_anchor_region_handling: exclude   # "exclude" | "rme" | "radio_map"
+    cgr:
+      num_gaussian: 12
+      ridge_lambda: 0.0001
+      baseline_method: distance_weighted
+      baseline_length_scale_m: 40.0
+      path_loss_exponent: 3.0
+      horizontal_beamwidth_deg: 65.0
+      vertical_beamwidth_deg: 65.0
+      bs_fraction: 0.15
+      beam_fraction: 0.35
+      path_fraction: 0.2
+      # Multiplier on the vertical-beamwidth-derived near/far footprint
+      # half-span (see algorithm/cgr_model.py's "beam_footprint" scale method).
+      longitudinal_scale_coeff: 1.0
+    # reward_type: "global" -- total covered-UE count / num_ut across the
+    #     WHOLE network, the SAME scalar given to every sector
+
+    #     "delta_covered" (2026-09-21) -- the RAW (unnormalized) CHANGE in
+    #     network-wide covered-UE count between this turn's pre- and
+    #     post-decision measurements 
+    reward_type: delta_covered
+    # "sync": every sector decides at once, off the same resolved power.
+    # "async": sectors decide in sequence 
     async_schedule: async            # "async" | "sync"
 
     dqn:
@@ -178,7 +378,7 @@ algorithms:
       # wesn only
       sequence_length: 16
       wesn:
-        units: 128
+        units: 256
         connectivity: 0.5
         spectral_radius: 0.9
         leaky: 1.0
@@ -190,29 +390,45 @@ algorithms:
         mlp_hidden_sizes: []
         mlp_position: early
       learning_rate: 2.5e-4
-      gamma: 0.95
+      gamma: 0.99
       batch_size: 32
       replay_capacity: 10000
       train_steps_per_interval: 1
-      target_update_steps: 50
+      target_update_steps: 200
       epsilon_start: 1.0
       epsilon_end: 0.01
-      epsilon_decay_rate: 0.996
-  
-test_tilt_window_calibration:
-  candidate_window_slots: [1, 10]
-  num_windows_per_candidate: 300
-  num_realizations_per_slot: 5
-  mobility_speed_settings:
-    - name: walk
-      min_ut_speed: 1.0
-      max_ut_speed: 2.0
-    - name: cycle
-      min_ut_speed: 5.0
-      max_ut_speed: 10.0
-    - name: urban_drive
-      min_ut_speed: 20.0
-      max_ut_speed: 30.0
-    - name: highway
-      min_ut_speed: 50.0
-      max_ut_speed: 80.0     
+      epsilon_decay_rate: 0.995
+
+    # ppo: continuous-action PPO (policy_name: ppo only)
+    ppo:
+      # model: mlp | wesn 
+      model: wesn
+      hidden_sizes: [64]
+      # wesn only
+      sequence_length: 16
+      wesn:
+        units: 256
+        connectivity: 0.5
+        spectral_radius: 0.9
+        leaky: 1.0
+        win_len: 16               # <= sequence_length
+        mlp_hidden_sizes: []
+        mlp_position: early
+      tilt_quantization_deg: 0.1
+      learning_rate: 3.0e-4
+      gamma: 0.99
+      gae_lambda: 0.95
+      clip_epsilon: 0.2
+      entropy_coef: 0.01
+      value_coef: 0.5
+      rollout_length: 64
+      epochs_per_update: 4
+      minibatch_size: 32
+      init_log_std: 0.5
+
+    # diagnostics: per-agent experience/Q-value/oracle-comparison logging
+    diagnostics:
+      enabled: true
+      log_q_values: true
+      log_oracle_comparison: true
+      out_subdir: diagnostics
